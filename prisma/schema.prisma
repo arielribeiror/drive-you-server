@@ -50,12 +50,14 @@ model MagicLinkToken {
   email           String
   emailNormalized String
   tokenHash       String    @unique
+  codeHash        String?
   expiresAt       DateTime
   consumedAt      DateTime?
   createdAt       DateTime  @default(now())
   user            User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([emailNormalized])
+  @@index([emailNormalized, codeHash])
   @@index([expiresAt])
 }
 

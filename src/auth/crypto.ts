@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 
 export const normalizeEmail = (email: string) => email.trim().toLowerCase();
 
@@ -7,6 +7,9 @@ export const isApplePrivateRelayEmail = (email?: string | null) =>
 
 export const createRandomToken = (bytes = 32) =>
   randomBytes(bytes).toString("base64url");
+
+export const createMagicCode = () =>
+  randomInt(0, 1_000_000).toString().padStart(6, "0");
 
 export const hashToken = (token: string) =>
   createHash("sha256").update(token).digest("hex");

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildMagicLink,
+  createMagicCode,
   hashToken,
   isApplePrivateRelayEmail,
   normalizeEmail,
@@ -29,5 +30,9 @@ describe("auth crypto helpers", () => {
     expect(buildMagicLink("driveyou://auth/magic-link", "abc")).toBe(
       "driveyou://auth/magic-link?token=abc",
     );
+  });
+
+  it("creates 6 digit magic codes", () => {
+    expect(createMagicCode()).toMatch(/^\d{6}$/);
   });
 });

@@ -12,6 +12,7 @@ import { findOrCreateUserForIdentity } from "../auth/accounts.js";
 import {
   addMinutes,
   buildMagicLink,
+  createMagicCode,
   createRandomToken,
   hashToken,
   normalizeEmail,
@@ -39,7 +40,11 @@ const magicRequestBodySchema = z.object({
 });
 
 const magicVerifyBodySchema = z.object({
-  token: z.string().min(16),
+  token: z
+    .string()
+    .trim()
+    .refine((value) => value.length >= 16 || /^\d{6}$/.test(value)),
+  email: z.string().email().optional(),
 });
 
 const refreshBodySchema = z.object({
@@ -129,6 +134,7 @@ export const registerAuthRoutes = async (app: FastifyInstance) => {
       });
 
       const rawToken = createRandomToken(32);
+      const code = createMagicCode();
       const magicLink = buildMagicLink(config.magicLinkBaseUrl, rawToken);
 
       await prisma.magicLinkToken.create({
@@ -137,16 +143,17 @@ export const registerAuthRoutes = async (app: FastifyInstance) => {
           email,
           emailNormalized,
           tokenHash: hashToken(rawToken),
+          codeHash: hashToken(code),
           expiresAt: addMinutes(new Date(), config.magicLinkTtlMinutes),
         },
       });
 
-      const emailResult = await sendMagicLinkEmail(email, magicLink);
+      const emailResult = await sendMagicLinkEmail(email, magicLink, code);
 
       return reply.code(202).send({
         ok: true,
         ...(config.nodeEnv !== "production" && !emailResult.sent
-          ? { devLink: magicLink }
+          ? { devLink: magicLink, devCode: code }
           : {}),
       });
     } catch (error) {
@@ -157,8 +164,8 @@ export const registerAuthRoutes = async (app: FastifyInstance) => {
 
       request.log.warn({ error }, "Magic link request failed.");
       return reply.code(500).send({
-        error: "request_failed",
-        message: "Magic link request failed.",
+        error: "magic_link_delivery_failed",
+        message: "auth.errors.magicLinkDeliveryFailed",
       });
     }
   });
@@ -170,11 +177,26 @@ export const registerAuthRoutes = async (app: FastifyInstance) => {
       return reply.code(400).send(validationError());
     }
 
+    const isCodeVerification = /^\d{6}$/.test(parsed.data.token);
+    const emailNormalized = parsed.data.email
+      ? normalizeEmail(parsed.data.email)
+      : null;
+
+    if (isCodeVerification && !emailNormalized) {
+      return reply.code(400).send(validationError());
+    }
+
     try {
       const session = await prisma.$transaction(async (tx) => {
         const tokenHash = hashToken(parsed.data.token);
-        const magicToken = await tx.magicLinkToken.findUnique({
-          where: { tokenHash },
+        const magicToken = await tx.magicLinkToken.findFirst({
+          where: isCodeVerification
+            ? {
+                codeHash: tokenHash,
+                emailNormalized: emailNormalized ?? undefined,
+              }
+            : { tokenHash },
+          orderBy: { createdAt: "desc" },
         });
 
         if (
