@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: drive-you-postgres
+    environment:
+      POSTGRES_USER: driveyou
+      POSTGRES_PASSWORD: driveyou
+      POSTGRES_DB: drive_you
+    ports:
+      - "5432:5432"
+    volumes:
+      - drive-you-postgres:/var/lib/postgresql/data
+
+volumes:
+  drive-you-postgres:
