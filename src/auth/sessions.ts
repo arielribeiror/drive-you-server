@@ -67,7 +67,14 @@ export const issueSession = async (
 };
 
 export const verifyAccessToken = async (accessToken: string) => {
-  const { payload } = await jwtVerify(accessToken, jwtSecret);
+  let payload: Awaited<ReturnType<typeof jwtVerify>>["payload"];
+
+  try {
+    const verifiedToken = await jwtVerify(accessToken, jwtSecret);
+    payload = verifiedToken.payload;
+  } catch {
+    throw new AuthError("Access token is invalid or expired.");
+  }
 
   if (!payload.sub) {
     throw new AuthError("Access token does not include a subject.");

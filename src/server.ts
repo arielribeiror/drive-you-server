@@ -1,10 +1,12 @@
 import cors from "@fastify/cors";
+import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 
 import { config } from "./config.js";
 import { prisma } from "./db.js";
 import { registerAuthRoutes } from "./routes/auth.js";
 import { registerMeRoutes } from "./routes/me.js";
+import { registerVehiclesRoutes } from "./routes/vehicles.js";
 
 const corsOrigin =
   config.corsOrigin === "*"
@@ -20,6 +22,13 @@ export const buildServer = async () => {
 
   await app.register(cors, {
     origin: corsOrigin,
+  });
+  await app.register(multipart, {
+    limits: {
+      fileSize: 5 * 1024 * 1024,
+      files: 1,
+    },
+    throwFileSizeLimit: true,
   });
 
   app.get("/health", async () => ({
@@ -48,6 +57,7 @@ export const buildServer = async () => {
 
   await registerAuthRoutes(app);
   await registerMeRoutes(app);
+  await registerVehiclesRoutes(app);
 
   return app;
 };

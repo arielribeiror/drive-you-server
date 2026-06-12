@@ -17,6 +17,7 @@ const envSchema = z.object({
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
   MAGIC_LINK_TTL_MINUTES: z.coerce.number().int().positive().default(15),
   MAGIC_LINK_BASE_URL: z.string().min(1).default("driveyou://auth/magic-link"),
+  VEHICLE_SHARE_INVITE_TTL_DAYS: z.coerce.number().int().positive().default(14),
   CORS_ORIGIN: z.string().default("*"),
   RESEND_API_KEY: z.string().optional(),
   RESEND_FROM_EMAIL: z
@@ -29,6 +30,8 @@ const envSchema = z.object({
   GOOGLE_ANDROID_CLIENT_ID: z.string().optional(),
   APPLE_CLIENT_IDS: z.string().optional(),
   APPLE_BUNDLE_ID: z.string().optional(),
+  REMOVE_BG_API_KEY: z.string().optional(),
+  VEHICLE_IMAGES_UPLOAD_DIR: z.string().default("uploads/vehicle-images"),
 });
 
 const env = envSchema.parse(process.env);
@@ -85,9 +88,12 @@ export const config = {
   refreshTokenTtlDays: env.REFRESH_TOKEN_TTL_DAYS,
   magicLinkTtlMinutes: env.MAGIC_LINK_TTL_MINUTES,
   magicLinkBaseUrl: env.MAGIC_LINK_BASE_URL,
+  vehicleShareInviteTtlDays: env.VEHICLE_SHARE_INVITE_TTL_DAYS,
   corsOrigin: env.CORS_ORIGIN,
   resendApiKey: env.RESEND_API_KEY,
   resendFromEmail: env.RESEND_FROM_EMAIL,
   googleClientIds,
   appleClientIds,
+  removeBgApiKey: env.REMOVE_BG_API_KEY,
+  vehicleImagesUploadDir: env.VEHICLE_IMAGES_UPLOAD_DIR,
 };
