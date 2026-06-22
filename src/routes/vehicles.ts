@@ -41,6 +41,7 @@ const vehicleImageMimeTypes = new Set(["image/jpeg", "image/png", "image/webp"])
 const toPublicVehicle = (vehicle: Vehicle) => ({
   id: vehicle.id,
   plate: vehicle.plate,
+  displayName: vehicle.displayName,
   renavam: vehicle.renavam,
   brandModel: vehicle.brandModel,
   manufactureYear: vehicle.manufactureYear,
@@ -134,6 +135,10 @@ const vehicleImagePublicUrl = (request: FastifyRequest, fileName: string) =>
 
 const vehicleIdParamsSchema = z.object({
   vehicleId: z.string().min(1),
+});
+
+const updateVehicleBodySchema = z.object({
+  displayName: z.string().trim().min(1).max(80),
 });
 
 const acceptShareInviteBodySchema = z.object({
@@ -278,6 +283,99 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
       return reply.code(500).send({
         error: "request_failed",
         message: "Vehicle list fetch failed.",
+      });
+    }
+  });
+
+  app.patch("/vehicles/:vehicleId", async (request, reply) => {
+    const parsedParams = vehicleIdParamsSchema.safeParse(request.params);
+    const parsedBody = updateVehicleBodySchema.safeParse(request.body);
+
+    if (!parsedParams.success || !parsedBody.success) {
+      return reply.code(400).send(validationError());
+    }
+
+    try {
+      const userId = await getAuthenticatedUserId(request);
+      const vehicle = await getVehicleWithAccess(
+        parsedParams.data.vehicleId,
+        userId,
+        ["owner"],
+      );
+
+      if (!vehicle) {
+        return reply.code(404).send({
+          error: "vehicle_not_found",
+          message: "Vehicle was not found for this user.",
+        });
+      }
+
+      const updatedVehicle = await prisma.vehicle.update({
+        where: { id: vehicle.id },
+        data: { displayName: parsedBody.data.displayName },
+      });
+
+      return reply.send({ vehicle: toPublicVehicle(updatedVehicle) });
+    } catch (error) {
+      if (isDatabaseConnectionError(error)) {
+        return reply.code(503).send(databaseUnavailablePayload);
+      }
+
+      if (error instanceof AuthError) {
+        return reply.code(401).send({
+          error: "invalid_access_token",
+          message: "Access token is invalid or expired.",
+        });
+      }
+
+      request.log.warn({ error }, "Vehicle update failed.");
+      return reply.code(500).send({
+        error: "request_failed",
+        message: "Vehicle update failed.",
+      });
+    }
+  });
+
+  app.delete("/vehicles/:vehicleId", async (request, reply) => {
+    const parsedParams = vehicleIdParamsSchema.safeParse(request.params);
+
+    if (!parsedParams.success) {
+      return reply.code(400).send(validationError());
+    }
+
+    try {
+      const userId = await getAuthenticatedUserId(request);
+      const vehicle = await getVehicleWithAccess(
+        parsedParams.data.vehicleId,
+        userId,
+        ["owner"],
+      );
+
+      if (!vehicle) {
+        return reply.code(404).send({
+          error: "vehicle_not_found",
+          message: "Vehicle was not found for this user.",
+        });
+      }
+
+      await prisma.vehicle.delete({ where: { id: vehicle.id } });
+      return reply.code(204).send();
+    } catch (error) {
+      if (isDatabaseConnectionError(error)) {
+        return reply.code(503).send(databaseUnavailablePayload);
+      }
+
+      if (error instanceof AuthError) {
+        return reply.code(401).send({
+          error: "invalid_access_token",
+          message: "Access token is invalid or expired.",
+        });
+      }
+
+      request.log.warn({ error }, "Vehicle deletion failed.");
+      return reply.code(500).send({
+        error: "request_failed",
+        message: "Vehicle deletion failed.",
       });
     }
   });
@@ -556,6 +654,64 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
       });
     }
   });
+
+  app.get(
+    "/vehicles/:vehicleId/maintenance-baselines",
+    async (request, reply) => {
+      const parsedParams = vehicleIdParamsSchema.safeParse(request.params);
+
+      if (!parsedParams.success) {
+        return reply.code(400).send(validationError());
+      }
+
+      try {
+        const userId = await getAuthenticatedUserId(request);
+        const vehicle = await getVehicleWithAccess(
+          parsedParams.data.vehicleId,
+          userId,
+        );
+
+        if (!vehicle) {
+          return reply.code(404).send({
+            error: "vehicle_not_found",
+            message: "Vehicle was not found for this user.",
+          });
+        }
+
+        const maintenanceBaselines =
+          await prisma.vehicleMaintenanceBaseline.findMany({
+            where: { vehicleId: vehicle.id },
+            orderBy: { item: "asc" },
+          });
+
+        return reply.send({
+          maintenanceBaselines: maintenanceBaselines.map(
+            toPublicMaintenanceBaseline,
+          ),
+        });
+      } catch (error) {
+        if (isDatabaseConnectionError(error)) {
+          return reply.code(503).send(databaseUnavailablePayload);
+        }
+
+        if (error instanceof AuthError) {
+          return reply.code(401).send({
+            error: "invalid_access_token",
+            message: "Access token is invalid or expired.",
+          });
+        }
+
+        request.log.warn(
+          { error },
+          "Vehicle maintenance baseline list failed.",
+        );
+        return reply.code(500).send({
+          error: "request_failed",
+          message: "Vehicle maintenance baseline list failed.",
+        });
+      }
+    },
+  );
 
   app.post(
     "/vehicles/:vehicleId/maintenance-baselines",

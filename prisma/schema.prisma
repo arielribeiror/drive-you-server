@@ -123,6 +123,7 @@ model Vehicle {
   id                  String                    @id @default(cuid())
   userId              String
   plate               String
+  displayName         String?
   renavam             String?
   brandModel          String?
   manufactureYear     Int?
