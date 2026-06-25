@@ -30,9 +30,14 @@ import {
   removeVehicleBackground,
 } from "../vehicles/background-removal.js";
 import { getMaintenanceSchedule } from "../vehicles/maintenance-baseline.js";
+import {
+  extractOdometerFromImage,
+  OdometerImageError,
+} from "../vehicles/odometer-image.js";
 
 const MAX_LICENSING_DOCUMENT_BYTES = 5 * 1024 * 1024;
 const MAX_VEHICLE_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_ODOMETER_IMAGE_BYTES = 10 * 1024 * 1024;
 const vehicleImageFileNameSchema = z.object({
   fileName: z.string().regex(/^[a-zA-Z0-9_-]+\.(?:jpe?g|png|webp)$/),
 });
@@ -48,6 +53,7 @@ const toPublicVehicle = (vehicle: Vehicle) => ({
   modelYear: vehicle.modelYear,
   ownerName: vehicle.ownerName,
   ownerDocumentMasked: vehicle.ownerDocumentMasked,
+  currentOdometerKm: vehicle.currentOdometerKm,
   verificationStatus: vehicle.verificationStatus,
   verificationSource: vehicle.verificationSource,
   heroImageOriginalUrl: vehicle.heroImageOriginalUrl,
@@ -89,6 +95,11 @@ const getFileTooLargePayload = () => ({
 const getVehicleImageTooLargePayload = () => ({
   error: "vehicle_image_too_large",
   message: "Vehicle image must be up to 10 MB.",
+});
+
+const getOdometerImageTooLargePayload = () => ({
+  error: "odometer_image_too_large",
+  message: "Odometer image must be up to 10 MB.",
 });
 
 const getRequestOrigin = (request: FastifyRequest) => {
@@ -137,9 +148,15 @@ const vehicleIdParamsSchema = z.object({
   vehicleId: z.string().min(1),
 });
 
-const updateVehicleBodySchema = z.object({
-  displayName: z.string().trim().min(1).max(80),
-});
+const updateVehicleBodySchema = z
+  .object({
+    displayName: z.string().trim().min(1).max(80).optional(),
+    currentOdometerKm: z.number().int().min(0).max(2_000_000).optional(),
+  })
+  .refine(
+    (body) =>
+      body.displayName !== undefined || body.currentOdometerKm !== undefined,
+  );
 
 const acceptShareInviteBodySchema = z.object({
   token: z.string().min(16),
@@ -310,9 +327,22 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
         });
       }
 
+      const updateData: {
+        currentOdometerKm?: number;
+        displayName?: string;
+      } = {};
+
+      if (parsedBody.data.displayName !== undefined) {
+        updateData.displayName = parsedBody.data.displayName;
+      }
+
+      if (parsedBody.data.currentOdometerKm !== undefined) {
+        updateData.currentOdometerKm = parsedBody.data.currentOdometerKm;
+      }
+
       const updatedVehicle = await prisma.vehicle.update({
         where: { id: vehicle.id },
-        data: { displayName: parsedBody.data.displayName },
+        data: updateData,
       });
 
       return reply.send({ vehicle: toPublicVehicle(updatedVehicle) });
@@ -654,6 +684,123 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
       });
     }
   });
+
+  app.post(
+    "/vehicles/:vehicleId/current-odometer/image",
+    async (request, reply) => {
+      const parsedParams = vehicleIdParamsSchema.safeParse(request.params);
+
+      if (!parsedParams.success) {
+        return reply.code(400).send(validationError());
+      }
+
+      try {
+        const userId = await getAuthenticatedUserId(request);
+        const vehicle = await getVehicleWithAccess(
+          parsedParams.data.vehicleId,
+          userId,
+        );
+
+        if (!vehicle) {
+          return reply.code(404).send({
+            error: "vehicle_not_found",
+            message: "Vehicle was not found for this user.",
+          });
+        }
+
+        const image = await request.file({
+          limits: {
+            fileSize: MAX_ODOMETER_IMAGE_BYTES,
+            files: 1,
+          },
+        });
+
+        if (!image) {
+          return reply.code(400).send({
+            error: "invalid_request",
+            message: "An odometer image is required.",
+          });
+        }
+
+        if (!isVehicleImagePart(image)) {
+          return reply.code(415).send({
+            error: "invalid_odometer_image",
+            message: "Odometer image must be a JPG, PNG, or WebP file.",
+          });
+        }
+
+        const imageBuffer = await image.toBuffer();
+        const imageMimeType = vehicleImageMimeTypes.has(image.mimetype)
+          ? image.mimetype
+          : getVehicleImageContentType(image.filename);
+        const reading = await extractOdometerFromImage({
+          apiKey: config.openaiApiKey,
+          buffer: imageBuffer,
+          fileName: image.filename,
+          mimeType: imageMimeType,
+          model: config.odometerReadingModel,
+        });
+        const updatedVehicle = await prisma.vehicle.update({
+          where: { id: vehicle.id },
+          data: {
+            currentOdometerKm: reading.odometerKm,
+          },
+        });
+
+        return reply.code(201).send({
+          vehicle: toPublicVehicle(updatedVehicle),
+          odometerReading: reading,
+        });
+      } catch (error) {
+        if (error instanceof app.multipartErrors.RequestFileTooLargeError) {
+          return reply.code(413).send(getOdometerImageTooLargePayload());
+        }
+
+        if (error instanceof OdometerImageError) {
+          if (error.code === "not_configured") {
+            return reply.code(501).send({
+              error: "odometer_ocr_not_configured",
+              message: "Odometer image reading is not configured.",
+            });
+          }
+
+          if (error.code === "unable_to_read") {
+            return reply.code(422).send({
+              error: "unable_to_read_odometer",
+              message: "Could not read the odometer from this image.",
+            });
+          }
+
+          request.log.warn({ error }, "Odometer image reading failed.");
+          return reply.code(502).send({
+            error: "odometer_ocr_failed",
+            message: "Odometer image reading failed.",
+          });
+        }
+
+        if (isDatabaseConnectionError(error)) {
+          request.log.warn(
+            { error },
+            "Database unavailable during vehicle odometer image upload.",
+          );
+          return reply.code(503).send(databaseUnavailablePayload);
+        }
+
+        if (error instanceof AuthError) {
+          return reply.code(401).send({
+            error: "invalid_access_token",
+            message: "Access token is invalid or expired.",
+          });
+        }
+
+        request.log.warn({ error }, "Vehicle odometer image upload failed.");
+        return reply.code(500).send({
+          error: "request_failed",
+          message: "Vehicle odometer image upload failed.",
+        });
+      }
+    },
+  );
 
   app.get(
     "/vehicles/:vehicleId/maintenance-baselines",

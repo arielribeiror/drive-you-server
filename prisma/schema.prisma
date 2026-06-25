@@ -130,6 +130,7 @@ model Vehicle {
   modelYear           Int?
   ownerName           String?
   ownerDocumentMasked String?
+  currentOdometerKm   Int?
   verificationStatus  VehicleVerificationStatus @default(pending_review)
   verificationSource  VehicleVerificationSource @default(licensing_pdf)
   documentHash        String?

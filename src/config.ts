@@ -31,6 +31,8 @@ const envSchema = z.object({
   APPLE_CLIENT_IDS: z.string().optional(),
   APPLE_BUNDLE_ID: z.string().optional(),
   REMOVE_BG_API_KEY: z.string().optional(),
+  OPENAI_API_KEY: z.string().optional(),
+  ODOMETER_READING_MODEL: z.string().min(1).default("gpt-5.5"),
   VEHICLE_IMAGES_UPLOAD_DIR: z.string().default("uploads/vehicle-images"),
 });
 
@@ -95,5 +97,7 @@ export const config = {
   googleClientIds,
   appleClientIds,
   removeBgApiKey: env.REMOVE_BG_API_KEY,
+  openaiApiKey: env.OPENAI_API_KEY,
+  odometerReadingModel: env.ODOMETER_READING_MODEL,
   vehicleImagesUploadDir: env.VEHICLE_IMAGES_UPLOAD_DIR,
 };

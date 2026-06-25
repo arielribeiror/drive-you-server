@@ -40,3 +40,12 @@ RESEND_FROM_EMAIL=Drive You <auth@your-verified-domain.com>
 ```
 
 `RESEND_FROM_EMAIL` must use a sender/domain verified in Resend. When `RESEND_API_KEY` is empty in development, the API does not send email and logs the magic link plus the 6-digit code instead.
+
+## Odometer image reading
+
+Dashboard photo reading during onboarding is optional. Set `OPENAI_API_KEY` to enable it; otherwise the API returns a controlled error and the app falls back to manual mileage entry.
+
+```bash
+OPENAI_API_KEY=sk-...
+ODOMETER_READING_MODEL=gpt-5.5
+```
