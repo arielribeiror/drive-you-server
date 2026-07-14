@@ -32,12 +32,14 @@ This service is ready to deploy on Railway using the Dockerfile in this folder.
 
 1. Create a new Railway project from the `drive-you-server` GitHub repository.
 2. If deploying from a monorepo instead, set the service root directory to `drive-you-server`.
-3. Add a PostgreSQL database to the same Railway project.
-4. Open the API service variables and add `DATABASE_URL` as a reference to the Postgres service. If the database service is named `Postgres`, use:
+3. Add a PostgreSQL database to the same Railway project and the same environment as the API service.
+4. Open the API service variables and add `DATABASE_URL` as a reference to the PostgreSQL service. The service name in the reference must match the exact PostgreSQL service name shown in the Railway canvas. If the database service is named `PostgreSQL`, use:
 
 ```bash
-DATABASE_URL=${{Postgres.DATABASE_URL}}
+DATABASE_URL=${{PostgreSQL.DATABASE_URL}}
 ```
+
+If the database service has another name, replace `PostgreSQL` with that exact name. Prefer Railway's reference variable picker/autocomplete instead of typing it manually.
 
 5. Add the remaining API variables. The minimum production set is:
 
@@ -66,14 +68,14 @@ GOOGLE_ANDROID_CLIENT_ID=<optional android client id>
 APPLE_CLIENT_IDS=<optional comma-separated Apple audiences>
 APPLE_BUNDLE_ID=com.driveyou.app
 RESEND_API_KEY=<optional, only when testing real email delivery>
-RESEND_FROM_EMAIL=Drive You <auth@your-verified-domain.com>
+RESEND_FROM_EMAIL=Drive You <auth@driveyou.app>
 OPENAI_API_KEY=<optional, only for odometer image reading>
 EXPO_PUSH_ACCESS_TOKEN=<optional Expo push access token>
 ```
 
 The Docker image runs `npx prisma migrate deploy` before `node dist/index.js`, so pending Prisma migrations are applied on each deploy before the API starts.
 
-After Railway gives the service a public domain, use that URL as `EXPO_PUBLIC_API_URL` when building the Android APK.
+Use `https://api.driveyou.app` as `EXPO_PUBLIC_API_URL` when building the Android APK.
 
 Google Sign-In requires every OAuth audience that can appear in app tokens to be configured in the API. Keep the app Web Client ID in `GOOGLE_WEB_CLIENT_ID`; for iOS native sign-in also copy the iOS OAuth Client ID into `GOOGLE_IOS_CLIENT_ID`. Alternatively, include all accepted audiences in `GOOGLE_CLIENT_IDS`.
 
@@ -85,10 +87,10 @@ Set these values in `.env`:
 
 ```bash
 RESEND_API_KEY=re_...
-RESEND_FROM_EMAIL=Drive You <auth@your-verified-domain.com>
+RESEND_FROM_EMAIL=Drive You <auth@driveyou.app>
 ```
 
-`RESEND_FROM_EMAIL` must use a sender/domain verified in Resend. When `RESEND_API_KEY` is empty in development, the API does not send email and logs the magic link plus the 6-digit code instead.
+`RESEND_FROM_EMAIL` must use a sender/domain verified in Resend. A mailbox does not need to exist for `auth@driveyou.app` as long as the sending domain is verified in Resend, but replies/bounces should be handled separately when we polish production email. When `RESEND_API_KEY` is empty in development, the API does not send email and logs the magic link plus the 6-digit code instead.
 
 ## Odometer image reading
 
