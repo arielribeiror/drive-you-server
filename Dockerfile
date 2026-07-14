@@ -24,10 +24,17 @@ FROM node:22-bookworm-slim AS runner
 
 WORKDIR /app
 ENV NODE_ENV=production
+ENV PATH="/opt/rembg/bin:${PATH}"
+ENV U2NET_HOME=/app/.u2net
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates openssl \
+  && apt-get install -y --no-install-recommends ca-certificates libgomp1 openssl python3 python3-venv \
   && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/rembg \
+  && /opt/rembg/bin/pip install --no-cache-dir --upgrade pip \
+  && /opt/rembg/bin/pip install --no-cache-dir "rembg[cpu,cli]>=2.0,<3.0" \
+  && mkdir -p /app/.u2net
 
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/package-lock.json ./package-lock.json

@@ -1,5 +1,6 @@
 # dependencies
 node_modules/
+.venv-rembg/
 
 # build output
 dist/

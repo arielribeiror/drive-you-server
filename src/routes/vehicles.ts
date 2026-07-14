@@ -772,10 +772,12 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
 
       const imageBuffer = await image.toBuffer();
       const transparentImageBuffer = await removeVehicleBackground({
-        apiKey: config.removeBgApiKey,
         buffer: imageBuffer,
+        command: config.rembgCommand,
         fileName: image.filename,
         mimeType: image.mimetype,
+        model: config.rembgModel,
+        timeoutMs: config.rembgTimeoutMs,
       });
       const uploadDir = path.join(
         process.cwd(),
@@ -827,7 +829,7 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
               : "vehicle_background_removal_failed",
           message:
             error.code === "not_configured"
-              ? "remove.bg API key is not configured."
+              ? "Background removal is not configured on the server."
               : "Vehicle image background removal failed.",
         });
       }

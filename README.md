@@ -18,7 +18,17 @@ npm run prisma:generate
 npm run prisma:migrate
 ```
 
-4. Start the API:
+4. Install the local background-removal runtime if you want vehicle hero image uploads to remove backgrounds during development:
+
+```bash
+python3.11 -m venv .venv-rembg
+. .venv-rembg/bin/activate
+pip install "rembg[cpu,cli]>=2.0,<3.0"
+```
+
+Then set `REMBG_COMMAND=.venv-rembg/bin/rembg` in `.env`. If `rembg` is installed somewhere else, set `REMBG_COMMAND` to that full executable path.
+
+5. Start the API:
 
 ```bash
 npm run dev
@@ -69,11 +79,14 @@ APPLE_CLIENT_IDS=<optional comma-separated Apple audiences>
 APPLE_BUNDLE_ID=com.driveyou.app
 RESEND_API_KEY=<optional, only when testing real email delivery>
 RESEND_FROM_EMAIL=Drive You <auth@driveyou.app>
+REMBG_COMMAND=rembg
+REMBG_MODEL=u2net
+REMBG_TIMEOUT_MS=180000
 OPENAI_API_KEY=<optional, only for odometer image reading>
 EXPO_PUSH_ACCESS_TOKEN=<optional Expo push access token>
 ```
 
-The Docker image runs `npx prisma migrate deploy` before `node dist/index.js`, so pending Prisma migrations are applied on each deploy before the API starts.
+The Docker image includes the `rembg` CPU runtime and runs `npx prisma migrate deploy` before `node dist/index.js`, so pending Prisma migrations are applied on each deploy before the API starts.
 
 Use `https://api.driveyou.app` as `EXPO_PUBLIC_API_URL` when building the Android APK.
 
@@ -100,3 +113,17 @@ Dashboard photo reading during onboarding is optional. Set `OPENAI_API_KEY` to e
 OPENAI_API_KEY=sk-...
 ODOMETER_READING_MODEL=gpt-5.5
 ```
+
+## Vehicle background removal
+
+Vehicle hero image uploads use the open-source `rembg` CLI on the API server. The app sends the image to the existing vehicle upload route; the API writes a temporary input file, runs `rembg`, stores the original upload and the transparent PNG, then removes the temporary files.
+
+Useful settings:
+
+```bash
+REMBG_COMMAND=rembg
+REMBG_MODEL=u2net
+REMBG_TIMEOUT_MS=180000
+```
+
+`u2net` is the default quality-oriented model. The first upload may take longer while `rembg` downloads the model into `U2NET_HOME`. For faster local tests on slower machines, try `REMBG_MODEL=u2netp`.
