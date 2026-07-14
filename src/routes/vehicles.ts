@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { FastifyInstance, FastifyRequest } from "fastify";
+import { Prisma } from "@prisma/client";
 import type {
   Vehicle,
   VehicleAccessRole,
@@ -34,6 +35,7 @@ import {
   extractOdometerFromImage,
   OdometerImageError,
 } from "../vehicles/odometer-image.js";
+import { createOilChangeLoggedNotifications } from "../notifications/service.js";
 
 const MAX_LICENSING_DOCUMENT_BYTES = 5 * 1024 * 1024;
 const MAX_VEHICLE_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -54,6 +56,7 @@ const toPublicVehicle = (vehicle: Vehicle) => ({
   ownerName: vehicle.ownerName,
   ownerDocumentMasked: vehicle.ownerDocumentMasked,
   currentOdometerKm: vehicle.currentOdometerKm,
+  currentOdometerIsEstimated: vehicle.currentOdometerIsEstimated,
   verificationStatus: vehicle.verificationStatus,
   verificationSource: vehicle.verificationSource,
   heroImageOriginalUrl: vehicle.heroImageOriginalUrl,
@@ -96,6 +99,10 @@ const getVehicleImageTooLargePayload = () => ({
   error: "vehicle_image_too_large",
   message: "Vehicle image must be up to 10 MB.",
 });
+
+const isUniqueConstraintError = (error: unknown) =>
+  error instanceof Prisma.PrismaClientKnownRequestError &&
+  error.code === "P2002";
 
 const getOdometerImageTooLargePayload = () => ({
   error: "odometer_image_too_large",
@@ -148,6 +155,27 @@ const vehicleIdParamsSchema = z.object({
   vehicleId: z.string().min(1),
 });
 
+const licensingDocumentVehicleSchema = z.object({
+  plate: z.string().min(1),
+  renavam: z.string().min(1),
+  brandModel: z.string().nullable(),
+  manufactureYear: z.number().int().nullable(),
+  modelYear: z.number().int().nullable(),
+  ownerName: z.string().nullable(),
+  ownerDocumentMasked: z.string().nullable(),
+});
+
+const licensingDocumentConfirmationBodySchema = z.object({
+  document: z.object({
+    hash: z.string().regex(/^[a-f0-9]{64}$/),
+    fileName: z.string().min(1).max(255),
+    mimeType: z.string().min(1).max(120),
+    sizeBytes: z.number().int().min(1).max(MAX_LICENSING_DOCUMENT_BYTES),
+  }),
+  existingVehicleResolution: z.enum(["replace"]).optional(),
+  extractedVehicle: licensingDocumentVehicleSchema,
+});
+
 const updateVehicleBodySchema = z
   .object({
     displayName: z.string().trim().min(1).max(80).optional(),
@@ -179,6 +207,8 @@ const maintenanceBaselineBodySchema = z.object({
     .refine((value) => !Number.isNaN(value.getTime()))
     .refine((value) => value.getTime() <= Date.now()),
   odometerKm: z.number().int().min(0).max(2_000_000),
+  intervalKm: z.number().int().min(1).max(2_000_000).optional(),
+  intervalMonths: z.number().int().min(1).max(600).optional(),
   usageProfile: z.enum(["severe", "light"]).optional(),
 });
 
@@ -254,11 +284,16 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
       const userId = await getAuthenticatedUserId(request);
       const vehicles = await prisma.vehicle.findMany({
         where: {
-          accesses: {
-            some: {
-              userId,
+          OR: [
+            {
+              accesses: {
+                some: {
+                  userId,
+                },
+              },
             },
-          },
+            { userId },
+          ],
         },
         include: {
           accesses: {
@@ -277,7 +312,8 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
       return reply.send({
         vehicles: vehicles.map(({ accesses, ...vehicle }) => ({
           ...toPublicVehicle(vehicle),
-          accessRole: accesses[0]?.role ?? "shared",
+          accessRole:
+            accesses[0]?.role ?? (vehicle.userId === userId ? "owner" : "shared"),
         })),
       });
     } catch (error) {
@@ -328,6 +364,7 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
       }
 
       const updateData: {
+        currentOdometerIsEstimated?: boolean;
         currentOdometerKm?: number;
         displayName?: string;
       } = {};
@@ -338,6 +375,7 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
 
       if (parsedBody.data.currentOdometerKm !== undefined) {
         updateData.currentOdometerKm = parsedBody.data.currentOdometerKm;
+        updateData.currentOdometerIsEstimated = false;
       }
 
       const updatedVehicle = await prisma.vehicle.update({
@@ -446,82 +484,67 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
 
       const parsedDocument = await extractLicensingDocumentFromPdf(buffer);
 
-      if (!parsedDocument.plate) {
+      if (!parsedDocument.plate || !parsedDocument.renavam) {
         return reply.code(422).send({
           error: "unable_to_read_vehicle_document",
-          message: "Could not find a vehicle plate in this PDF.",
+          message: "Could not find required vehicle identity fields in this PDF.",
           missingFields: parsedDocument.missingFields,
         });
       }
 
       const plate = parsedDocument.plate;
+      const renavam = parsedDocument.renavam;
       const documentHash = createHash("sha256").update(buffer).digest("hex");
-      const vehicle = await prisma.$transaction(async (tx) => {
-        const upsertedVehicle = await tx.vehicle.upsert({
-          where: {
-            userId_plate: {
-              userId,
-              plate,
-            },
-          },
-          create: {
-            userId,
-            plate,
-            renavam: parsedDocument.renavam,
-            brandModel: parsedDocument.brandModel,
-            manufactureYear: parsedDocument.manufactureYear,
-            modelYear: parsedDocument.modelYear,
-            ownerName: parsedDocument.ownerName,
-            ownerDocumentMasked: parsedDocument.ownerDocumentMasked,
-            verificationStatus: "pending_review",
-            verificationSource: "licensing_pdf",
-            documentHash,
-            documentFileName: document.filename,
-            documentMimeType: document.mimetype,
-            documentSizeBytes: buffer.length,
-          },
-          update: {
-            renavam: parsedDocument.renavam,
-            brandModel: parsedDocument.brandModel,
-            manufactureYear: parsedDocument.manufactureYear,
-            modelYear: parsedDocument.modelYear,
-            ownerName: parsedDocument.ownerName,
-            ownerDocumentMasked: parsedDocument.ownerDocumentMasked,
-            verificationStatus: "pending_review",
-            verificationSource: "licensing_pdf",
-            documentHash,
-            documentFileName: document.filename,
-            documentMimeType: document.mimetype,
-            documentSizeBytes: buffer.length,
-          },
-        });
-
-        await tx.vehicleAccess.upsert({
-          where: {
-            userId_vehicleId: {
-              userId,
-              vehicleId: upsertedVehicle.id,
-            },
-          },
-          create: {
-            userId,
-            vehicleId: upsertedVehicle.id,
-            role: "owner",
-          },
-          update: {
-            role: "owner",
-          },
-        });
-
-        return upsertedVehicle;
-      });
-
-      return reply.code(201).send({
-        vehicle: toPublicVehicle(vehicle),
-        extraction: {
-          confidence: parsedDocument.confidence,
-          missingFields: parsedDocument.missingFields,
+      const extractedVehicle = {
+        plate,
+        renavam,
+        brandModel: parsedDocument.brandModel,
+        manufactureYear: parsedDocument.manufactureYear,
+        modelYear: parsedDocument.modelYear,
+        ownerName: parsedDocument.ownerName,
+        ownerDocumentMasked: parsedDocument.ownerDocumentMasked,
+      };
+      const existingVehicle = await prisma.vehicle.findFirst({
+        where: {
+          userId,
+          renavam,
         },
+      });
+      const documentData = {
+        hash: documentHash,
+        fileName: document.filename,
+        mimeType: document.mimetype,
+        sizeBytes: buffer.length,
+      };
+      const extraction = {
+        confidence: parsedDocument.confidence,
+        missingFields: parsedDocument.missingFields,
+      };
+
+      if (existingVehicle) {
+        return reply.code(200).send({
+          status: "existing_vehicle",
+          vehicle: toPublicVehicle(existingVehicle),
+          extractedVehicle,
+          document: documentData,
+          existingVehicleMatch: {
+            renavamMatches: true,
+            plateMatches: existingVehicle.plate === plate,
+            existingPlate: existingVehicle.plate,
+            extractedPlate: plate,
+            existingRenavam: existingVehicle.renavam,
+            extractedRenavam: renavam,
+            canReplace: existingVehicle.plate !== plate,
+          },
+          extraction,
+        });
+      }
+
+      return reply.code(200).send({
+        status: "ready_for_confirmation",
+        extractedVehicle,
+        document: documentData,
+        extraction,
       });
     } catch (error) {
       if (error instanceof app.multipartErrors.RequestFileTooLargeError) {
@@ -550,10 +573,157 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
         });
       }
 
+      if (isUniqueConstraintError(error)) {
+        request.log.warn(
+          { error },
+          "Vehicle document matched an existing vehicle constraint.",
+        );
+        return reply.code(409).send({
+          error: "vehicle_already_exists",
+          message: "Vehicle already exists for this user.",
+        });
+      }
+
       request.log.warn({ error }, "Vehicle licensing document upload failed.");
       return reply.code(500).send({
         error: "request_failed",
         message: "Vehicle licensing document upload failed.",
+      });
+    }
+  });
+
+  app.post("/vehicles/licensing-document/confirm", async (request, reply) => {
+    const parsedBody = licensingDocumentConfirmationBodySchema.safeParse(
+      request.body,
+    );
+
+    if (!parsedBody.success) {
+      return reply.code(400).send(validationError());
+    }
+
+    try {
+      const userId = await getAuthenticatedUserId(request);
+      const { document, existingVehicleResolution, extractedVehicle } =
+        parsedBody.data;
+      const existingVehicle = await prisma.vehicle.findFirst({
+        where: {
+          userId,
+          renavam: extractedVehicle.renavam,
+        },
+      });
+
+      if (existingVehicle && existingVehicleResolution !== "replace") {
+        await prisma.vehicleAccess.upsert({
+          where: {
+            userId_vehicleId: {
+              userId,
+              vehicleId: existingVehicle.id,
+            },
+          },
+          create: {
+            userId,
+            vehicleId: existingVehicle.id,
+            role: "owner",
+          },
+          update: {
+            role: "owner",
+          },
+        });
+
+        return reply.code(200).send({
+          status: "existing_vehicle",
+          vehicle: toPublicVehicle(existingVehicle),
+          extractedVehicle,
+          document,
+          existingVehicleMatch: {
+            renavamMatches: true,
+            plateMatches: existingVehicle.plate === extractedVehicle.plate,
+            existingPlate: existingVehicle.plate,
+            extractedPlate: extractedVehicle.plate,
+            existingRenavam: existingVehicle.renavam,
+            extractedRenavam: extractedVehicle.renavam,
+            canReplace: existingVehicle.plate !== extractedVehicle.plate,
+          },
+        });
+      }
+
+      const vehicleData = {
+        ...extractedVehicle,
+        verificationStatus: "pending_review" as const,
+        verificationSource: "licensing_pdf" as const,
+        documentHash: document.hash,
+        documentFileName: document.fileName,
+        documentMimeType: document.mimeType,
+        documentSizeBytes: document.sizeBytes,
+      };
+      const vehicle = await prisma.$transaction(async (tx) => {
+        const upsertedVehicle = existingVehicle
+          ? await tx.vehicle.update({
+              where: { id: existingVehicle.id },
+              data: vehicleData,
+            })
+          : await tx.vehicle.create({
+              data: {
+                userId,
+                ...vehicleData,
+              },
+            });
+
+        await tx.vehicleAccess.upsert({
+          where: {
+            userId_vehicleId: {
+              userId,
+              vehicleId: upsertedVehicle.id,
+            },
+          },
+          create: {
+            userId,
+            vehicleId: upsertedVehicle.id,
+            role: "owner",
+          },
+          update: {
+            role: "owner",
+          },
+        });
+
+        return upsertedVehicle;
+      });
+
+      return reply.code(existingVehicle ? 200 : 201).send({
+        status: existingVehicle ? "updated_existing_vehicle" : "created_vehicle",
+        vehicle: toPublicVehicle(vehicle),
+      });
+    } catch (error) {
+      if (isDatabaseConnectionError(error)) {
+        request.log.warn(
+          { error },
+          "Database unavailable during vehicle document confirmation.",
+        );
+        return reply.code(503).send(databaseUnavailablePayload);
+      }
+
+      if (error instanceof AuthError) {
+        return reply.code(401).send({
+          error: "invalid_access_token",
+          message: "Access token is invalid or expired.",
+        });
+      }
+
+      if (isUniqueConstraintError(error)) {
+        request.log.warn(
+          { error },
+          "Vehicle document confirmation matched an existing vehicle constraint.",
+        );
+        return reply.code(409).send({
+          error: "vehicle_already_exists",
+          message: "Vehicle already exists for this user.",
+        });
+      }
+
+      request.log.warn({ error }, "Vehicle document confirmation failed.");
+      return reply.code(500).send({
+        error: "request_failed",
+        message: "Vehicle document confirmation failed.",
       });
     }
   });
@@ -744,6 +914,7 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
           where: { id: vehicle.id },
           data: {
             currentOdometerKm: reading.odometerKm,
+            currentOdometerIsEstimated: false,
           },
         });
 
@@ -891,6 +1062,9 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
           parsedBody.data.item,
           usageProfile,
         );
+        const intervalKm = parsedBody.data.intervalKm ?? schedule.intervalKm;
+        const intervalMonths =
+          parsedBody.data.intervalMonths ?? schedule.intervalMonths;
         const baseline = await prisma.vehicleMaintenanceBaseline.upsert({
           where: {
             vehicleId_item: {
@@ -905,8 +1079,8 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
             performedAt: parsedBody.data.performedAt,
             odometerKm: parsedBody.data.odometerKm,
             usageProfile,
-            intervalKm: schedule.intervalKm,
-            intervalMonths: schedule.intervalMonths,
+            intervalKm,
+            intervalMonths,
             intervalDays: schedule.intervalDays,
           },
           update: {
@@ -914,11 +1088,23 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
             performedAt: parsedBody.data.performedAt,
             odometerKm: parsedBody.data.odometerKm,
             usageProfile,
-            intervalKm: schedule.intervalKm,
-            intervalMonths: schedule.intervalMonths,
+            intervalKm,
+            intervalMonths,
             intervalDays: schedule.intervalDays,
           },
         });
+
+        if (baseline.item === "engine_oil") {
+          await createOilChangeLoggedNotifications({
+            baseline,
+            vehicleId: vehicle.id,
+          }).catch((error) => {
+            request.log.warn(
+              { error },
+              "Oil change notification creation failed.",
+            );
+          });
+        }
 
         return reply.code(201).send({
           maintenanceBaseline: toPublicMaintenanceBaseline(baseline),

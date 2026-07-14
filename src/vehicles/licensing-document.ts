@@ -151,14 +151,21 @@ const isBlockedFieldValue = (value: string) => {
 
 const BLOCKED_OWNER_TERMS = [
   "ACESSAR",
+  "AGORA",
   "APLICAVEL",
+  "BAIXE",
   "COMODIDADE",
+  "DESCONTO",
   "ENTIDADE",
   "EXECUTIVO",
+  "GANHA",
+  "INFRACOES",
   "MENSAGENS",
   "ORGAO",
   "PARA",
   "PORTAL",
+  "QR CODE",
+  "SERVICOS",
   "TRANSITO",
   "VOCE",
 ];
@@ -404,6 +411,14 @@ const extractBrandModel = (lines: string[]) => {
     }
   }
 
+  const importedModel = lines.find((line) =>
+    /^[A-Z]{1,3}\s*\/\s*[A-Z0-9][A-Z0-9\s./-]{4,}$/i.test(line),
+  );
+
+  if (importedModel && looksLikeVehicleModel(importedModel)) {
+    return normalizeVehicleModel(importedModel);
+  }
+
   const followingValue = findFollowingValue(
     lines,
     [/MARCA.*MODELO/, /MODELO.*VERSAO/, /^MODELO$/],
@@ -415,13 +430,7 @@ const extractBrandModel = (lines: string[]) => {
     return normalizeVehicleModel(followingValue);
   }
 
-  const importedModel = lines.find((line) =>
-    /^[A-Z]{1,3}\s*\/\s*[A-Z0-9][A-Z0-9\s./-]{4,}$/i.test(line),
-  );
-
-  return importedModel && looksLikeVehicleModel(importedModel)
-    ? normalizeVehicleModel(importedModel)
-    : null;
+  return null;
 };
 
 const looksLikeOwnerName = (value: string) => {
@@ -468,6 +477,29 @@ const extractOwnerName = (lines: string[]) => {
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
+    const ownerBeforeDocument = cleanOwnerCandidateBeforeDocument(line);
+
+    if (ownerBeforeDocument && looksLikeOwnerName(ownerBeforeDocument)) {
+      return ownerBeforeDocument;
+    }
+
+    if (!OWNER_DOCUMENT_REGEX.test(line)) {
+      continue;
+    }
+
+    for (const candidate of lines
+      .slice(Math.max(index - 4, 0), index)
+      .reverse()) {
+      const ownerCandidate = cleanOwnerCandidate(candidate);
+
+      if (ownerCandidate && looksLikeOwnerName(ownerCandidate)) {
+        return ownerCandidate;
+      }
+    }
+  }
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     const inlineValue = getInlineValueAfter(
       line,
       /^.*NOME(?:\s+DO\s+PROPRIET[AÁ]RIO)?(?:\s+CPF\s*\/?\s*CNPJ)?\s*/i,
@@ -487,7 +519,8 @@ const extractOwnerName = (lines: string[]) => {
     for (const candidate of lines.slice(index + 1, index + 9)) {
       const normalizedCandidate = normalizeForMatch(candidate);
       const ownerCandidate =
-        cleanOwnerCandidateBeforeDocument(candidate) ?? cleanOwnerCandidate(candidate);
+        cleanOwnerCandidateBeforeDocument(candidate) ??
+        cleanOwnerCandidate(candidate);
 
       if (ownerCandidate && looksLikeOwnerName(ownerCandidate)) {
         return ownerCandidate;
@@ -502,28 +535,6 @@ const extractOwnerName = (lines: string[]) => {
         (!ownerCandidate || !looksLikeOwnerName(ownerCandidate))
       ) {
         break;
-      }
-
-    }
-  }
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const ownerBeforeDocument = cleanOwnerCandidateBeforeDocument(line);
-
-    if (ownerBeforeDocument && looksLikeOwnerName(ownerBeforeDocument)) {
-      return ownerBeforeDocument;
-    }
-
-    if (!OWNER_DOCUMENT_REGEX.test(line)) {
-      continue;
-    }
-
-    for (const candidate of lines.slice(Math.max(index - 4, 0), index).reverse()) {
-      const ownerCandidate = cleanOwnerCandidate(candidate);
-
-      if (ownerCandidate && looksLikeOwnerName(ownerCandidate)) {
-        return ownerCandidate;
       }
     }
   }
@@ -548,11 +559,40 @@ const maskDocument = (value: string) => {
   return cleanValue(value);
 };
 
-const extractOwnerDocument = (lines: string[]) => {
-  const labeledWindow = extractWindowAfterLabel(lines, [/CPF.*CNPJ/, /CPF/, /CNPJ/]);
+const extractOwnerDocument = (lines: string[], ownerName: string | null) => {
+  if (ownerName) {
+    const normalizedOwnerName = normalizeForMatch(ownerName);
+
+    for (let index = 0; index < lines.length; index += 1) {
+      if (!normalizeForMatch(lines[index]).includes(normalizedOwnerName)) {
+        continue;
+      }
+
+      const ownerWindow = lines.slice(index, index + 3).join(" ");
+      const ownerMatch = ownerWindow.match(OWNER_DOCUMENT_REGEX);
+
+      if (ownerMatch) {
+        return maskDocument(ownerMatch[0]);
+      }
+    }
+  }
+
+  const labeledWindow = extractWindowAfterLabel(lines, [
+    /CPF.*CNPJ/,
+    /CPF/,
+    /CNPJ/,
+  ]);
   const match = labeledWindow.match(OWNER_DOCUMENT_REGEX);
 
-  return match ? maskDocument(match[0]) : null;
+  if (match) {
+    return maskDocument(match[0]);
+  }
+
+  const formattedDocument = lines
+    .map((line) => line.match(OWNER_DOCUMENT_REGEX)?.[0] ?? null)
+    .find((document) => document && /[./-]/.test(document));
+
+  return formattedDocument ? maskDocument(formattedDocument) : null;
 };
 
 type ParsedVehicleFields = Pick<
@@ -591,6 +631,7 @@ export const parseLicensingDocumentText = (
   const lines = toLines(text);
   const normalizedText = lines.join("\n");
   const vehicleYears = extractVehicleYears(lines);
+  const ownerName = extractOwnerName(lines);
 
   const parsedWithoutConfidence = {
     plate: extractPlate(normalizedText),
@@ -598,8 +639,8 @@ export const parseLicensingDocumentText = (
     brandModel: extractBrandModel(lines),
     manufactureYear: vehicleYears.manufactureYear,
     modelYear: vehicleYears.modelYear,
-    ownerName: extractOwnerName(lines),
-    ownerDocumentMasked: extractOwnerDocument(lines),
+    ownerName,
+    ownerDocumentMasked: extractOwnerDocument(lines, ownerName),
   };
   const missingFields = getMissingFields(parsedWithoutConfidence);
 

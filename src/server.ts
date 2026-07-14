@@ -6,6 +6,9 @@ import { config } from "./config.js";
 import { prisma } from "./db.js";
 import { registerAuthRoutes } from "./routes/auth.js";
 import { registerMeRoutes } from "./routes/me.js";
+import { startNotificationWorker } from "./notifications/worker.js";
+import { registerNotificationRoutes } from "./routes/notifications.js";
+import { registerTripsRoutes } from "./routes/trips.js";
 import { registerVehiclesRoutes } from "./routes/vehicles.js";
 
 const corsOrigin =
@@ -58,6 +61,13 @@ export const buildServer = async () => {
   await registerAuthRoutes(app);
   await registerMeRoutes(app);
   await registerVehiclesRoutes(app);
+  await registerTripsRoutes(app);
+  await registerNotificationRoutes(app);
+
+  const stopNotificationWorker = startNotificationWorker(app.log);
+  app.addHook("onClose", async () => {
+    stopNotificationWorker();
+  });
 
   return app;
 };

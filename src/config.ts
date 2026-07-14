@@ -34,6 +34,13 @@ const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   ODOMETER_READING_MODEL: z.string().min(1).default("gpt-5.5"),
   VEHICLE_IMAGES_UPLOAD_DIR: z.string().default("uploads/vehicle-images"),
+  NOTIFICATION_WORKER_ENABLED: z.string().default("true"),
+  NOTIFICATION_WORKER_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(60 * 60 * 1000),
+  EXPO_PUSH_ACCESS_TOKEN: z.string().optional(),
 });
 
 const env = envSchema.parse(process.env);
@@ -45,6 +52,9 @@ const splitCsv = (value?: string) =>
     .filter(Boolean) ?? [];
 
 const unique = (values: string[]) => [...new Set(values)];
+
+const parseBoolean = (value: string) =>
+  !["0", "false", "no", "off"].includes(value.trim().toLowerCase());
 
 const jwtSecret =
   env.JWT_SECRET ??
@@ -100,4 +110,8 @@ export const config = {
   openaiApiKey: env.OPENAI_API_KEY,
   odometerReadingModel: env.ODOMETER_READING_MODEL,
   vehicleImagesUploadDir: env.VEHICLE_IMAGES_UPLOAD_DIR,
+  notificationWorkerEnabled:
+    env.NODE_ENV !== "test" && parseBoolean(env.NOTIFICATION_WORKER_ENABLED),
+  notificationWorkerIntervalMs: env.NOTIFICATION_WORKER_INTERVAL_MS,
+  expoPushAccessToken: env.EXPO_PUSH_ACCESS_TOKEN,
 };

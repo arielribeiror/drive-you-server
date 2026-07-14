@@ -50,6 +50,38 @@ enum VehicleShareInviteStatus {
   revoked
 }
 
+enum VehicleTripDetectionSource {
+  gps
+  motion_activity
+  mixed
+}
+
+enum AppNotificationType {
+  maintenance_due
+  preventive_maintenance
+  oil_change_logged
+  driving_tip
+}
+
+enum AppNotificationTone {
+  info
+  success
+  warning
+}
+
+enum PushDevicePlatform {
+  android
+  ios
+  web
+}
+
+enum PushDeliveryStatus {
+  pending
+  sent
+  delivered
+  failed
+}
+
 model User {
   id              String           @id @default(cuid())
   email           String?
@@ -66,6 +98,9 @@ model User {
   acceptedVehicleShareInvites VehicleShareInvite[] @relation("VehicleShareInvitesAccepted")
   vehicleAccesses             VehicleAccess[]
   maintenanceBaselines        VehicleMaintenanceBaseline[]
+  vehicleTrips                VehicleTrip[]
+  appNotifications            AppNotification[]
+  pushDevices                 PushDevice[]
 }
 
 model AuthIdentity {
@@ -131,6 +166,7 @@ model Vehicle {
   ownerName           String?
   ownerDocumentMasked String?
   currentOdometerKm   Int?
+  currentOdometerIsEstimated Boolean @default(false)
   verificationStatus  VehicleVerificationStatus @default(pending_review)
   verificationSource  VehicleVerificationSource @default(licensing_pdf)
   documentHash        String?
@@ -147,10 +183,41 @@ model Vehicle {
   accesses            VehicleAccess[]
   shareInvites        VehicleShareInvite[]
   maintenanceBaselines VehicleMaintenanceBaseline[]
+  trips               VehicleTrip[]
+  appNotifications    AppNotification[]
 
-  @@unique([userId, plate])
+  @@unique([userId, renavam])
   @@index([plate])
+  @@index([renavam])
   @@index([userId])
+}
+
+model VehicleTrip {
+  id              String                     @id @default(cuid())
+  vehicleId       String
+  driverUserId    String
+  clientTripId    String
+  startedAt       DateTime
+  endedAt         DateTime
+  durationSeconds Int
+  distanceMeters  Int
+  averageSpeedKmh Int?
+  maxSpeedKmh     Int?
+  startLatitude   Float
+  startLongitude  Float
+  endLatitude     Float
+  endLongitude    Float
+  routePolyline   String?
+  routeSampleCount Int                      @default(0)
+  detectionSource VehicleTripDetectionSource
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+  driver          User                      @relation(fields: [driverUserId], references: [id], onDelete: Cascade)
+  vehicle         Vehicle                   @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  @@unique([driverUserId, clientTripId])
+  @@index([vehicleId, startedAt])
+  @@index([driverUserId, startedAt])
 }
 
 model VehicleShareInvite {
@@ -213,4 +280,65 @@ model VehicleMaintenanceBaseline {
   @@index([vehicleId])
   @@index([userId])
   @@index([item])
+}
+
+model AppNotification {
+  id         String              @id @default(cuid())
+  userId     String
+  vehicleId  String?
+  type       AppNotificationType
+  tone       AppNotificationTone @default(info)
+  payload    Json
+  dedupeKey  String
+  readAt     DateTime?
+  pushedAt   DateTime?
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
+  user       User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicle    Vehicle?            @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+  deliveries PushDelivery[]
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+  @@index([vehicleId])
+  @@index([type])
+}
+
+model PushDevice {
+  id               String             @id @default(cuid())
+  userId           String
+  expoPushToken    String             @unique
+  platform         PushDevicePlatform
+  locale           String?
+  isActive         Boolean            @default(true)
+  lastRegisteredAt DateTime           @default(now())
+  disabledAt       DateTime?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  user             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deliveries       PushDelivery[]
+
+  @@index([userId, isActive])
+  @@index([expoPushToken])
+}
+
+model PushDelivery {
+  id              String             @id @default(cuid())
+  notificationId  String
+  deviceId        String?
+  expoPushToken   String
+  status          PushDeliveryStatus @default(pending)
+  ticketId        String?
+  error           String?
+  receiptCheckedAt DateTime?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  notification    AppNotification    @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  device          PushDevice?        @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+  @@unique([notificationId, deviceId])
+  @@index([notificationId])
+  @@index([ticketId])
+  @@index([status, createdAt])
 }

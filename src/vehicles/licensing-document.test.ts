@@ -79,6 +79,48 @@ describe("licensing document parser", () => {
     });
   });
 
+  it("ignores promotional copy when CRLV-e labels and values are separate blocks", () => {
+    const parsed = parseLicensingDocumentText(`
+      CERTIFICADO DE REGISTRO E LICENCIAMENTO DE VEICULO - DIGITAL
+      CODIGO RENAVAM
+      ANO FABRICACAO
+      ANO MODELO
+      PLACA EXERCICIO
+      NOME
+      LOCAL DATA
+      CPF / CNPJ
+      MENSAGENS SENATRAN
+      NUMERO DO CRV
+      MARCA / MODELO / VERSAO
+      Na Carteira Digital de Transito voce tem acesso ao CRLV e ainda ganha
+      desconto nas infracoes, alem de muitos outros servicos de transito.
+      Leia o QR Code e baixe agora.
+      01126670810
+      FXQ6G03 2025
+      2016 2017
+      244185723679
+      42440208217 ***
+      I/FORD FOCUS TI AT 2.0HC
+      PASSAGEIRO AUTOMOVEL
+      NAO APLICAVEL
+      MARIA DA SILVA
+      123.456.789-00
+      SAO JOSE DOS CAMPOS SP 18/01/2025
+    `);
+
+    expect(parsed).toMatchObject({
+      plate: "FXQ6G03",
+      renavam: "01126670810",
+      manufactureYear: 2016,
+      modelYear: 2017,
+      brandModel: "I/FORD FOCUS TI AT 2.0HC",
+      ownerName: "MARIA DA SILVA",
+      ownerDocumentMasked: "***.456.789-**",
+      confidence: "high",
+      missingFields: [],
+    });
+  });
+
   it("extracts owner name when the PDF joins owner and document labels", () => {
     const parsed = parseLicensingDocumentText(`
       NOME CPF / CNPJ
