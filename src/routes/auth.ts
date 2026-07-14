@@ -24,7 +24,10 @@ import {
   rotateRefreshToken,
 } from "../auth/sessions.js";
 import { verifyAppleIdentityToken } from "../auth/providers/apple.js";
-import { verifyGoogleIdToken } from "../auth/providers/google.js";
+import {
+  getGoogleIdTokenDiagnostics,
+  verifyGoogleIdToken,
+} from "../auth/providers/google.js";
 import { sendMagicLinkEmail } from "../email/magic-link.js";
 
 const googleBodySchema = z.object({
@@ -82,7 +85,13 @@ export const registerAuthRoutes = async (app: FastifyInstance) => {
         return reply.code(503).send(databaseUnavailablePayload);
       }
 
-      request.log.warn({ error }, "Google authentication failed.");
+      request.log.warn(
+        {
+          error,
+          googleToken: getGoogleIdTokenDiagnostics(parsed.data.idToken),
+        },
+        "Google authentication failed.",
+      );
       return reply.code(401).send({
         error: "invalid_google_token",
         message: "Google authentication failed.",
