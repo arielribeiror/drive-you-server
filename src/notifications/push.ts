@@ -8,6 +8,7 @@ import type {
 import { config } from "../config.js";
 import { prisma } from "../db.js";
 import { formatPushContent } from "./content.js";
+import { getNotificationPreference, isNowInQuietHours } from "./preferences.js";
 
 const EXPO_PUSH_SEND_URL = "https://exp.host/--/api/v2/push/send";
 const EXPO_PUSH_RECEIPTS_URL = "https://exp.host/--/api/v2/push/getReceipts";
@@ -206,6 +207,19 @@ export const sendNotificationPushes = async (notificationId: string) => {
   });
 
   if (!notification) {
+    return [];
+  }
+
+  const preference = await getNotificationPreference(
+    notification.userId,
+    notification.type,
+  );
+
+  if (!preference.pushEnabled) {
+    return [];
+  }
+
+  if (isNowInQuietHours(preference)) {
     return [];
   }
 

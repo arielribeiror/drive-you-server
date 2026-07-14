@@ -30,6 +30,13 @@ export type NotificationVehicle = {
   displayName: string | null;
   plate: string;
   accesses: Array<{ userId: string }>;
+  maintenanceHealth?: Array<{
+    baselineId: string;
+    item: string;
+    remainingDays: number | null;
+    remainingKm: number | null;
+    status: string;
+  }>;
   maintenanceBaselines: NotificationMaintenanceBaseline[];
 };
 
@@ -138,8 +145,19 @@ export const buildNotificationInputsForVehicles = (
         vehicle.currentOdometerKm,
         now,
       );
+      const oilHealth = vehicle.maintenanceHealth?.find(
+        (item) => item.baselineId === engineOilBaseline.id,
+      );
+      const resolvedOilState =
+        oilHealth &&
+        (oilHealth.status === "attention" || oilHealth.status === "due")
+          ? {
+              remainingDays: oilHealth.remainingDays,
+              remainingKm: oilHealth.remainingKm,
+            }
+          : oilState;
 
-      if (oilState) {
+      if (resolvedOilState) {
         for (const userId of accessUserIds) {
           inputs.push({
             userId,
@@ -152,8 +170,8 @@ export const buildNotificationInputsForVehicles = (
             payload: {
               baselineId: engineOilBaseline.id,
               item: engineOilBaseline.item,
-              remainingDays: oilState.remainingDays,
-              remainingKm: oilState.remainingKm,
+              remainingDays: resolvedOilState.remainingDays,
+              remainingKm: resolvedOilState.remainingKm,
               vehicleId: vehicle.id,
               vehicleTitle,
             },

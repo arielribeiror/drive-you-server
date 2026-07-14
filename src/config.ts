@@ -35,6 +35,12 @@ const envSchema = z.object({
   REMBG_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
   OPENAI_API_KEY: z.string().optional(),
   ODOMETER_READING_MODEL: z.string().min(1).default("gpt-5.5"),
+  FIPE_API_BASE_URL: z
+    .string()
+    .url()
+    .default("https://fipe.parallelum.com.br/api/v2"),
+  FIPE_SUBSCRIPTION_TOKEN: z.string().optional(),
+  FIPE_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   VEHICLE_IMAGES_UPLOAD_DIR: z.string().default("uploads/vehicle-images"),
   NOTIFICATION_WORKER_ENABLED: z.string().default("true"),
   NOTIFICATION_WORKER_INTERVAL_MS: z.coerce
@@ -101,6 +107,9 @@ export const config = {
   rembgTimeoutMs: env.REMBG_TIMEOUT_MS,
   openaiApiKey: env.OPENAI_API_KEY,
   odometerReadingModel: env.ODOMETER_READING_MODEL,
+  fipeApiBaseUrl: env.FIPE_API_BASE_URL,
+  fipeSubscriptionToken: env.FIPE_SUBSCRIPTION_TOKEN,
+  fipeTimeoutMs: env.FIPE_TIMEOUT_MS,
   vehicleImagesUploadDir: env.VEHICLE_IMAGES_UPLOAD_DIR,
   notificationWorkerEnabled:
     env.NODE_ENV !== "test" && parseBoolean(env.NOTIFICATION_WORKER_ENABLED),

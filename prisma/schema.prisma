@@ -13,12 +13,6 @@ enum AuthProvider {
   magic_link
 }
 
-enum VehicleVerificationStatus {
-  pending_review
-  verified
-  rejected
-}
-
 enum VehicleVerificationSource {
   licensing_pdf
 }
@@ -43,6 +37,18 @@ enum VehicleAccessRole {
   shared
 }
 
+enum FipeVehicleType {
+  cars
+  motorcycles
+  trucks
+}
+
+enum FipeLinkSource {
+  automatic
+  confirmed
+  manual
+}
+
 enum VehicleShareInviteStatus {
   pending
   accepted
@@ -56,11 +62,25 @@ enum VehicleTripDetectionSource {
   mixed
 }
 
+enum VehicleMaintenanceEventSource {
+  onboarding
+  manual
+  baseline_update
+}
+
 enum AppNotificationType {
   maintenance_due
   preventive_maintenance
   oil_change_logged
   driving_tip
+}
+
+enum NotificationPreferenceType {
+  maintenance_due
+  preventive_maintenance
+  oil_change_logged
+  driving_tip
+  trip_confirmation
 }
 
 enum AppNotificationTone {
@@ -94,12 +114,15 @@ model User {
   magicLinkTokens MagicLinkToken[]
   refreshTokens   RefreshToken[]
   vehicles        Vehicle[]
+  documentConfirmedVehicles  Vehicle[] @relation("VehicleDocumentConfirmations")
   sentVehicleShareInvites     VehicleShareInvite[] @relation("VehicleShareInvitesSent")
   acceptedVehicleShareInvites VehicleShareInvite[] @relation("VehicleShareInvitesAccepted")
   vehicleAccesses             VehicleAccess[]
   maintenanceBaselines        VehicleMaintenanceBaseline[]
+  maintenanceEvents           VehicleMaintenanceEvent[]
   vehicleTrips                VehicleTrip[]
   appNotifications            AppNotification[]
+  notificationPreferences     NotificationPreference[]
   pushDevices                 PushDevice[]
 }
 
@@ -167,29 +190,59 @@ model Vehicle {
   ownerDocumentMasked String?
   currentOdometerKm   Int?
   currentOdometerIsEstimated Boolean @default(false)
-  verificationStatus  VehicleVerificationStatus @default(pending_review)
   verificationSource  VehicleVerificationSource @default(licensing_pdf)
   documentHash        String?
   documentFileName    String?
   documentMimeType    String?
   documentSizeBytes   Int?
+  documentConfirmedAt DateTime?
+  documentConfirmedByUserId String?
   heroImageOriginalUrl String?
   heroImageUrl         String?
   heroImageMimeType    String?
   heroImageSizeBytes   Int?
+  fipeVehicleType      FipeVehicleType?
+  fipeBrandCode        String?
+  fipeModelCode        String?
+  fipeYearId           String?
+  fipeCode             String?
+  fipeDisplayName      String?
+  fipeLinkSource       FipeLinkSource?
+  fipeLinkedAt         DateTime?
   createdAt           DateTime                  @default(now())
   updatedAt           DateTime                  @updatedAt
   user                User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documentConfirmedByUser User?                 @relation("VehicleDocumentConfirmations", fields: [documentConfirmedByUserId], references: [id], onDelete: SetNull)
   accesses            VehicleAccess[]
   shareInvites        VehicleShareInvite[]
   maintenanceBaselines VehicleMaintenanceBaseline[]
+  maintenanceEvents    VehicleMaintenanceEvent[]
   trips               VehicleTrip[]
   appNotifications    AppNotification[]
+  fipePrices          VehicleFipePrice[]
 
   @@unique([userId, renavam])
   @@index([plate])
   @@index([renavam])
   @@index([userId])
+  @@index([fipeCode])
+}
+
+model VehicleFipePrice {
+  id             String   @id @default(cuid())
+  vehicleId      String
+  fipeCode       String
+  yearId         String
+  referenceCode  String
+  referenceMonth String
+  priceCents     Int
+  fetchedAt      DateTime @default(now())
+  createdAt      DateTime @default(now())
+  vehicle        Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  @@unique([vehicleId, fipeCode, yearId, referenceCode])
+  @@index([vehicleId, fetchedAt])
+  @@index([fipeCode, yearId])
 }
 
 model VehicleTrip {
@@ -282,6 +335,26 @@ model VehicleMaintenanceBaseline {
   @@index([item])
 }
 
+model VehicleMaintenanceEvent {
+  id          String                    @id @default(cuid())
+  userId      String
+  vehicleId   String
+  item        VehicleMaintenanceItem
+  source      VehicleMaintenanceEventSource @default(manual)
+  performedAt DateTime
+  odometerKm  Int
+  costCents   Int?
+  notes       String?
+  createdAt   DateTime                  @default(now())
+  updatedAt   DateTime                  @updatedAt
+  user        User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicle     Vehicle                   @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  @@index([vehicleId, performedAt])
+  @@index([userId, performedAt])
+  @@index([item])
+}
+
 model AppNotification {
   id         String              @id @default(cuid())
   userId     String
@@ -302,6 +375,23 @@ model AppNotification {
   @@index([userId, createdAt])
   @@index([userId, readAt])
   @@index([vehicleId])
+  @@index([type])
+}
+
+model NotificationPreference {
+  id              String                     @id @default(cuid())
+  userId          String
+  type            NotificationPreferenceType
+  inAppEnabled    Boolean                    @default(true)
+  pushEnabled     Boolean                    @default(true)
+  quietHoursStart String?
+  quietHoursEnd   String?
+  createdAt       DateTime                   @default(now())
+  updatedAt       DateTime                   @updatedAt
+  user            User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, type])
+  @@index([userId])
   @@index([type])
 }
 

@@ -7,6 +7,7 @@ import type {
   Vehicle,
   VehicleAccessRole,
   VehicleMaintenanceBaseline,
+  VehicleMaintenanceEvent,
 } from "@prisma/client";
 import { z } from "zod";
 
@@ -36,6 +37,23 @@ import {
   OdometerImageError,
 } from "../vehicles/odometer-image.js";
 import { createOilChangeLoggedNotifications } from "../notifications/service.js";
+import { calculateMaintenanceHealth } from "../vehicles/maintenance-health.js";
+import {
+  buildFipeValuation,
+  FipeClient,
+  FipeClientError,
+  fipeVehicleTypeSchema,
+  getConfidentAutomaticCandidate,
+  isFipeCacheFresh,
+  priceHistoryFromDetail,
+  resolveFipeCandidates,
+  toFipeDisplayName,
+  type CachedFipePrice,
+  type FipeCandidate,
+  type FipeLinkSource,
+  type FipeValuation,
+  type FipeValuationHistoryPoint,
+} from "../vehicles/fipe.js";
 
 const MAX_LICENSING_DOCUMENT_BYTES = 5 * 1024 * 1024;
 const MAX_VEHICLE_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -57,10 +75,24 @@ const toPublicVehicle = (vehicle: Vehicle) => ({
   ownerDocumentMasked: vehicle.ownerDocumentMasked,
   currentOdometerKm: vehicle.currentOdometerKm,
   currentOdometerIsEstimated: vehicle.currentOdometerIsEstimated,
-  verificationStatus: vehicle.verificationStatus,
+  verificationStatus: vehicle.documentConfirmedAt
+    ? ("confirmed_by_user" as const)
+    : ("unconfirmed" as const),
   verificationSource: vehicle.verificationSource,
+  ownershipStatus: vehicle.documentConfirmedAt
+    ? ("confirmed_by_user" as const)
+    : ("unconfirmed" as const),
+  documentConfirmedAt: vehicle.documentConfirmedAt?.toISOString() ?? null,
   heroImageOriginalUrl: vehicle.heroImageOriginalUrl,
   heroImageUrl: vehicle.heroImageUrl,
+  fipeVehicleType: vehicle.fipeVehicleType,
+  fipeBrandCode: vehicle.fipeBrandCode,
+  fipeModelCode: vehicle.fipeModelCode,
+  fipeYearId: vehicle.fipeYearId,
+  fipeCode: vehicle.fipeCode,
+  fipeDisplayName: vehicle.fipeDisplayName,
+  fipeLinkSource: vehicle.fipeLinkSource,
+  fipeLinkedAt: vehicle.fipeLinkedAt?.toISOString() ?? null,
   updatedAt: vehicle.updatedAt.toISOString(),
 });
 
@@ -77,6 +109,19 @@ const toPublicMaintenanceBaseline = (
   intervalMonths: baseline.intervalMonths,
   intervalDays: baseline.intervalDays,
   updatedAt: baseline.updatedAt.toISOString(),
+});
+
+const toPublicMaintenanceEvent = (event: VehicleMaintenanceEvent) => ({
+  id: event.id,
+  vehicleId: event.vehicleId,
+  item: event.item,
+  source: event.source,
+  performedAt: event.performedAt.toISOString(),
+  odometerKm: event.odometerKm,
+  costCents: event.costCents,
+  notes: event.notes,
+  createdAt: event.createdAt.toISOString(),
+  updatedAt: event.updatedAt.toISOString(),
 });
 
 const isPdfPart = (part: { filename: string; mimetype: string }) =>
@@ -154,6 +199,18 @@ const vehicleImagePublicUrl = (request: FastifyRequest, fileName: string) =>
 const vehicleIdParamsSchema = z.object({
   vehicleId: z.string().min(1),
 });
+const fipeLinkBodySchema = z.object({
+  brandCode: z.string().min(1),
+  modelCode: z.string().min(1),
+  source: z.enum(["confirmed", "manual"]).optional(),
+  vehicleType: fipeVehicleTypeSchema,
+  yearId: z.string().min(1),
+});
+const fipeOptionsQuerySchema = z.object({
+  brandCode: z.string().min(1).optional(),
+  modelCode: z.string().min(1).optional(),
+  vehicleType: fipeVehicleTypeSchema.default("cars"),
+});
 
 const licensingDocumentVehicleSchema = z.object({
   plate: z.string().min(1),
@@ -209,6 +266,31 @@ const maintenanceBaselineBodySchema = z.object({
   odometerKm: z.number().int().min(0).max(2_000_000),
   intervalKm: z.number().int().min(1).max(2_000_000).optional(),
   intervalMonths: z.number().int().min(1).max(600).optional(),
+  source: z.enum(["onboarding", "manual", "baseline_update"]).optional(),
+  usageProfile: z.enum(["severe", "light"]).optional(),
+});
+
+const maintenanceEventBodySchema = z.object({
+  item: z.enum([
+    "engine_oil",
+    "tires",
+    "suspension",
+    "brake_fluid",
+    "brake_disc",
+    "brake_pads",
+    "tire_pressure",
+  ]),
+  performedAt: z
+    .string()
+    .min(1)
+    .transform((value) => new Date(value))
+    .refine((value) => !Number.isNaN(value.getTime()))
+    .refine((value) => value.getTime() <= Date.now()),
+  odometerKm: z.number().int().min(0).max(2_000_000),
+  intervalKm: z.number().int().min(1).max(2_000_000).optional(),
+  intervalMonths: z.number().int().min(1).max(600).optional(),
+  costCents: z.number().int().min(0).max(100_000_000).optional(),
+  notes: z.string().trim().max(500).optional(),
   usageProfile: z.enum(["severe", "light"]).optional(),
 });
 
@@ -249,7 +331,284 @@ const getVehicleWithAccess = (
     },
   });
 
+const hasFipeLink = (vehicle: Vehicle) =>
+  Boolean(vehicle.fipeVehicleType && vehicle.fipeCode && vehicle.fipeYearId);
+
+const toPublicFipeLink = (vehicle: Vehicle) => {
+  if (!hasFipeLink(vehicle)) {
+    return null;
+  }
+
+  return {
+    brandCode: vehicle.fipeBrandCode,
+    codeFipe: vehicle.fipeCode,
+    displayName: vehicle.fipeDisplayName,
+    linkedAt: vehicle.fipeLinkedAt?.toISOString() ?? null,
+    modelCode: vehicle.fipeModelCode,
+    source: vehicle.fipeLinkSource,
+    vehicleType: vehicle.fipeVehicleType,
+    yearId: vehicle.fipeYearId,
+  };
+};
+
+const toPublicFipeCandidate = (candidate: FipeCandidate) => ({
+  brandCode: candidate.brandCode,
+  brandName: candidate.brandName,
+  codeFipe: candidate.codeFipe,
+  confidence: candidate.confidence,
+  displayName: candidate.displayName,
+  modelCode: candidate.modelCode,
+  modelName: candidate.modelName,
+  modelYear: candidate.modelYear,
+  priceCents: candidate.priceCents,
+  score: candidate.score,
+  vehicleType: candidate.vehicleType,
+  yearId: candidate.yearId,
+  yearName: candidate.yearName,
+});
+
+const toCachedFipePrice = (price: {
+  fetchedAt: Date;
+  priceCents: number;
+  referenceCode: string;
+  referenceMonth: string;
+}): CachedFipePrice => ({
+  fetchedAt: price.fetchedAt,
+  priceCents: price.priceCents,
+  referenceCode: price.referenceCode,
+  referenceMonth: price.referenceMonth,
+});
+
+const getFipeErrorPayload = (error: FipeClientError) => {
+  if (error.code === "rate_limited") {
+    return {
+      error: "fipe_rate_limited",
+      message: "FIPE API rate limit reached.",
+      status: 429,
+    };
+  }
+
+  if (error.code === "not_found") {
+    return {
+      error: "invalid_fipe_link",
+      message: "FIPE vehicle was not found.",
+      status: 422,
+    };
+  }
+
+  return {
+    error: "fipe_unavailable",
+    message: "FIPE API is unavailable.",
+    status: 502,
+  };
+};
+
+const getCachedVehicleFipePrices = (
+  vehicleId: string,
+  fipeCode: string,
+  yearId: string,
+) =>
+  prisma.vehicleFipePrice.findMany({
+    where: {
+      fipeCode,
+      vehicleId,
+      yearId,
+    },
+  });
+
+const cacheVehicleFipePrices = async ({
+  fipeCode,
+  history,
+  vehicleId,
+  yearId,
+}: {
+  readonly fipeCode: string;
+  readonly history: FipeValuationHistoryPoint[];
+  readonly vehicleId: string;
+  readonly yearId: string;
+}) => {
+  const fetchedAt = new Date();
+
+  if (history.length === 0) {
+    return [];
+  }
+
+  await prisma.$transaction(
+    history.map((point) =>
+      prisma.vehicleFipePrice.upsert({
+        where: {
+          vehicleId_fipeCode_yearId_referenceCode: {
+            fipeCode,
+            referenceCode: point.referenceCode,
+            vehicleId,
+            yearId,
+          },
+        },
+        create: {
+          fetchedAt,
+          fipeCode,
+          priceCents: point.priceCents,
+          referenceCode: point.referenceCode,
+          referenceMonth: point.referenceMonth,
+          vehicleId,
+          yearId,
+        },
+        update: {
+          fetchedAt,
+          priceCents: point.priceCents,
+          referenceMonth: point.referenceMonth,
+        },
+      }),
+    ),
+  );
+
+  return history.map((point) => ({
+    ...point,
+    fetchedAt,
+  }));
+};
+
+const getLinkedFipeValuation = async (
+  fipeClient: FipeClient,
+  vehicle: Vehicle,
+): Promise<{ stale: boolean; valuation: FipeValuation | null }> => {
+  if (!vehicle.fipeVehicleType || !vehicle.fipeCode || !vehicle.fipeYearId) {
+    return { stale: false, valuation: null };
+  }
+
+  const cachedPrices = (
+    await getCachedVehicleFipePrices(
+      vehicle.id,
+      vehicle.fipeCode,
+      vehicle.fipeYearId,
+    )
+  ).map(toCachedFipePrice);
+
+  if (isFipeCacheFresh(cachedPrices)) {
+    return {
+      stale: false,
+      valuation: buildFipeValuation(cachedPrices),
+    };
+  }
+
+  try {
+    const detail = await fipeClient.getVehicleHistoryByFipeCode(
+      vehicle.fipeVehicleType,
+      vehicle.fipeCode,
+      vehicle.fipeYearId,
+    );
+    const freshPrices = await cacheVehicleFipePrices({
+      fipeCode: vehicle.fipeCode,
+      history: priceHistoryFromDetail(detail),
+      vehicleId: vehicle.id,
+      yearId: vehicle.fipeYearId,
+    });
+
+    return {
+      stale: false,
+      valuation: buildFipeValuation(freshPrices),
+    };
+  } catch (error) {
+    const staleValuation = buildFipeValuation(cachedPrices);
+
+    if (staleValuation) {
+      return {
+        stale: true,
+        valuation: staleValuation,
+      };
+    }
+
+    throw error;
+  }
+};
+
+const applyFipeCandidateLink = (
+  vehicleId: string,
+  candidate: FipeCandidate,
+  source: FipeLinkSource,
+) =>
+  prisma.vehicle.update({
+    where: { id: vehicleId },
+    data: {
+      fipeBrandCode: candidate.brandCode,
+      fipeCode: candidate.codeFipe,
+      fipeDisplayName: candidate.displayName,
+      fipeLinkedAt: new Date(),
+      fipeLinkSource: source,
+      fipeModelCode: candidate.modelCode,
+      fipeVehicleType: candidate.vehicleType,
+      fipeYearId: candidate.yearId,
+    },
+  });
+
+const getFipeResponseForVehicle = async (
+  fipeClient: FipeClient,
+  vehicle: Vehicle,
+) => {
+  if (hasFipeLink(vehicle)) {
+    const { stale, valuation } = await getLinkedFipeValuation(
+      fipeClient,
+      vehicle,
+    );
+
+    return {
+      candidates: [],
+      error: null,
+      link: toPublicFipeLink(vehicle),
+      stale,
+      status: valuation ? "linked" : "unavailable",
+      valuation,
+      vehicle,
+    };
+  }
+
+  const candidates = await resolveFipeCandidates(fipeClient, {
+    brandModel: vehicle.brandModel,
+    manufactureYear: vehicle.manufactureYear,
+    modelYear: vehicle.modelYear,
+  });
+  const automaticCandidate = getConfidentAutomaticCandidate(candidates);
+
+  if (automaticCandidate) {
+    const linkedVehicle = await applyFipeCandidateLink(
+      vehicle.id,
+      automaticCandidate,
+      "automatic",
+    );
+    const { stale, valuation } = await getLinkedFipeValuation(
+      fipeClient,
+      linkedVehicle,
+    );
+
+    return {
+      candidates: [],
+      error: null,
+      link: toPublicFipeLink(linkedVehicle),
+      stale,
+      status: valuation ? "linked" : "unavailable",
+      valuation,
+      vehicle: linkedVehicle,
+    };
+  }
+
+  return {
+    candidates: candidates.map(toPublicFipeCandidate),
+    error: null,
+    link: null,
+    stale: false,
+    status: candidates.length > 0 ? "needs_confirmation" : "needs_link",
+    valuation: null,
+    vehicle,
+  };
+};
+
 export const registerVehiclesRoutes = async (app: FastifyInstance) => {
+  const fipeClient = new FipeClient({
+    baseUrl: config.fipeApiBaseUrl,
+    timeoutMs: config.fipeTimeoutMs,
+    token: config.fipeSubscriptionToken,
+  });
+
   app.get("/uploads/vehicle-images/:fileName", async (request, reply) => {
     const parsedParams = vehicleImageFileNameSchema.safeParse(request.params);
 
@@ -613,26 +972,38 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
       });
 
       if (existingVehicle && existingVehicleResolution !== "replace") {
-        await prisma.vehicleAccess.upsert({
-          where: {
-            userId_vehicleId: {
+        const confirmedVehicle = await prisma.$transaction(async (tx) => {
+          const updatedVehicle = await tx.vehicle.update({
+            where: { id: existingVehicle.id },
+            data: {
+              documentConfirmedAt: new Date(),
+              documentConfirmedByUserId: userId,
+            },
+          });
+
+          await tx.vehicleAccess.upsert({
+            where: {
+              userId_vehicleId: {
+                userId,
+                vehicleId: existingVehicle.id,
+              },
+            },
+            create: {
               userId,
               vehicleId: existingVehicle.id,
+              role: "owner",
             },
-          },
-          create: {
-            userId,
-            vehicleId: existingVehicle.id,
-            role: "owner",
-          },
-          update: {
-            role: "owner",
-          },
+            update: {
+              role: "owner",
+            },
+          });
+
+          return updatedVehicle;
         });
 
         return reply.code(200).send({
           status: "existing_vehicle",
-          vehicle: toPublicVehicle(existingVehicle),
+          vehicle: toPublicVehicle(confirmedVehicle),
           extractedVehicle,
           document,
           existingVehicleMatch: {
@@ -649,12 +1020,13 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
 
       const vehicleData = {
         ...extractedVehicle,
-        verificationStatus: "pending_review" as const,
         verificationSource: "licensing_pdf" as const,
         documentHash: document.hash,
         documentFileName: document.fileName,
         documentMimeType: document.mimeType,
         documentSizeBytes: document.sizeBytes,
+        documentConfirmedAt: new Date(),
+        documentConfirmedByUserId: userId,
       };
       const vehicle = await prisma.$transaction(async (tx) => {
         const upsertedVehicle = existingVehicle
@@ -975,6 +1347,246 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
     },
   );
 
+  app.get("/vehicles/:vehicleId/fipe", async (request, reply) => {
+    const parsedParams = vehicleIdParamsSchema.safeParse(request.params);
+
+    if (!parsedParams.success) {
+      return reply.code(400).send(validationError());
+    }
+
+    try {
+      const userId = await getAuthenticatedUserId(request);
+      const vehicle = await getVehicleWithAccess(
+        parsedParams.data.vehicleId,
+        userId,
+      );
+
+      if (!vehicle) {
+        return reply.code(404).send({
+          error: "vehicle_not_found",
+          message: "Vehicle was not found for this user.",
+        });
+      }
+
+      try {
+        const response = await getFipeResponseForVehicle(fipeClient, vehicle);
+
+        return reply.send({
+          candidates: response.candidates,
+          error: response.error,
+          link: response.link,
+          stale: response.stale,
+          status: response.status,
+          valuation: response.valuation,
+          vehicle: toPublicVehicle(response.vehicle),
+        });
+      } catch (error) {
+        if (error instanceof FipeClientError) {
+          request.log.warn(
+            { error, vehicleId: vehicle.id },
+            "Vehicle FIPE fetch failed.",
+          );
+          return reply.send({
+            candidates: [],
+            error: getFipeErrorPayload(error).error,
+            link: toPublicFipeLink(vehicle),
+            stale: false,
+            status: "unavailable",
+            valuation: null,
+            vehicle: toPublicVehicle(vehicle),
+          });
+        }
+
+        throw error;
+      }
+    } catch (error) {
+      if (isDatabaseConnectionError(error)) {
+        return reply.code(503).send(databaseUnavailablePayload);
+      }
+
+      if (error instanceof AuthError) {
+        return reply.code(401).send({
+          error: "invalid_access_token",
+          message: "Access token is invalid or expired.",
+        });
+      }
+
+      request.log.warn({ error }, "Vehicle FIPE fetch failed.");
+      return reply.code(500).send({
+        error: "request_failed",
+        message: "Vehicle FIPE fetch failed.",
+      });
+    }
+  });
+
+  app.get("/vehicles/:vehicleId/fipe/options", async (request, reply) => {
+    const parsedParams = vehicleIdParamsSchema.safeParse(request.params);
+    const parsedQuery = fipeOptionsQuerySchema.safeParse(request.query);
+
+    if (!parsedParams.success || !parsedQuery.success) {
+      return reply.code(400).send(validationError());
+    }
+
+    try {
+      const userId = await getAuthenticatedUserId(request);
+      const vehicle = await getVehicleWithAccess(
+        parsedParams.data.vehicleId,
+        userId,
+      );
+
+      if (!vehicle) {
+        return reply.code(404).send({
+          error: "vehicle_not_found",
+          message: "Vehicle was not found for this user.",
+        });
+      }
+
+      const { brandCode, modelCode, vehicleType } = parsedQuery.data;
+
+      if (!brandCode) {
+        const brands = await fipeClient.getBrands(vehicleType);
+
+        return reply.send({ brands, vehicleType });
+      }
+
+      if (!modelCode) {
+        const models = await fipeClient.getModels(vehicleType, brandCode);
+
+        return reply.send({ brandCode, models, vehicleType });
+      }
+
+      const years = await fipeClient.getYearsByModel(
+        vehicleType,
+        brandCode,
+        modelCode,
+      );
+
+      return reply.send({ brandCode, modelCode, vehicleType, years });
+    } catch (error) {
+      if (isDatabaseConnectionError(error)) {
+        return reply.code(503).send(databaseUnavailablePayload);
+      }
+
+      if (error instanceof AuthError) {
+        return reply.code(401).send({
+          error: "invalid_access_token",
+          message: "Access token is invalid or expired.",
+        });
+      }
+
+      if (error instanceof FipeClientError) {
+        const payload = getFipeErrorPayload(error);
+        return reply.code(payload.status).send({
+          error: payload.error,
+          message: payload.message,
+        });
+      }
+
+      request.log.warn({ error }, "Vehicle FIPE options fetch failed.");
+      return reply.code(500).send({
+        error: "request_failed",
+        message: "Vehicle FIPE options fetch failed.",
+      });
+    }
+  });
+
+  app.put("/vehicles/:vehicleId/fipe-link", async (request, reply) => {
+    const parsedParams = vehicleIdParamsSchema.safeParse(request.params);
+    const parsedBody = fipeLinkBodySchema.safeParse(request.body);
+
+    if (!parsedParams.success || !parsedBody.success) {
+      return reply.code(400).send(validationError());
+    }
+
+    try {
+      const userId = await getAuthenticatedUserId(request);
+      const vehicle = await getVehicleWithAccess(
+        parsedParams.data.vehicleId,
+        userId,
+        ["owner"],
+      );
+
+      if (!vehicle) {
+        return reply.code(404).send({
+          error: "vehicle_not_found",
+          message: "Vehicle was not found for this user.",
+        });
+      }
+
+      const { brandCode, modelCode, source, vehicleType, yearId } =
+        parsedBody.data;
+      const detail = await fipeClient.getVehicleDetailByModel(
+        vehicleType,
+        brandCode,
+        modelCode,
+        yearId,
+      );
+      const updatedVehicle = await prisma.vehicle.update({
+        where: { id: vehicle.id },
+        data: {
+          fipeBrandCode: brandCode,
+          fipeCode: detail.codeFipe,
+          fipeDisplayName: toFipeDisplayName(detail),
+          fipeLinkedAt: new Date(),
+          fipeLinkSource: source ?? "manual",
+          fipeModelCode: modelCode,
+          fipeVehicleType: vehicleType,
+          fipeYearId: yearId,
+        },
+      });
+
+      await cacheVehicleFipePrices({
+        fipeCode: detail.codeFipe,
+        history: priceHistoryFromDetail(detail),
+        vehicleId: updatedVehicle.id,
+        yearId,
+      });
+
+      const { stale, valuation } = await getLinkedFipeValuation(
+        fipeClient,
+        updatedVehicle,
+      );
+
+      return reply.send({
+        fipe: {
+          candidates: [],
+          error: null,
+          link: toPublicFipeLink(updatedVehicle),
+          stale,
+          status: valuation ? "linked" : "unavailable",
+          valuation,
+          vehicle: toPublicVehicle(updatedVehicle),
+        },
+        vehicle: toPublicVehicle(updatedVehicle),
+      });
+    } catch (error) {
+      if (isDatabaseConnectionError(error)) {
+        return reply.code(503).send(databaseUnavailablePayload);
+      }
+
+      if (error instanceof AuthError) {
+        return reply.code(401).send({
+          error: "invalid_access_token",
+          message: "Access token is invalid or expired.",
+        });
+      }
+
+      if (error instanceof FipeClientError) {
+        const payload = getFipeErrorPayload(error);
+        return reply.code(payload.status).send({
+          error: payload.error,
+          message: payload.message,
+        });
+      }
+
+      request.log.warn({ error }, "Vehicle FIPE link update failed.");
+      return reply.code(500).send({
+        error: "request_failed",
+        message: "Vehicle FIPE link update failed.",
+      });
+    }
+  });
+
   app.get(
     "/vehicles/:vehicleId/maintenance-baselines",
     async (request, reply) => {
@@ -1067,33 +1679,48 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
         const intervalKm = parsedBody.data.intervalKm ?? schedule.intervalKm;
         const intervalMonths =
           parsedBody.data.intervalMonths ?? schedule.intervalMonths;
-        const baseline = await prisma.vehicleMaintenanceBaseline.upsert({
-          where: {
-            vehicleId_item: {
+        const baseline = await prisma.$transaction(async (tx) => {
+          const nextBaseline = await tx.vehicleMaintenanceBaseline.upsert({
+            where: {
+              vehicleId_item: {
+                vehicleId: vehicle.id,
+                item: parsedBody.data.item,
+              },
+            },
+            create: {
+              userId,
               vehicleId: vehicle.id,
               item: parsedBody.data.item,
+              performedAt: parsedBody.data.performedAt,
+              odometerKm: parsedBody.data.odometerKm,
+              usageProfile,
+              intervalKm,
+              intervalMonths,
+              intervalDays: schedule.intervalDays,
             },
-          },
-          create: {
-            userId,
-            vehicleId: vehicle.id,
-            item: parsedBody.data.item,
-            performedAt: parsedBody.data.performedAt,
-            odometerKm: parsedBody.data.odometerKm,
-            usageProfile,
-            intervalKm,
-            intervalMonths,
-            intervalDays: schedule.intervalDays,
-          },
-          update: {
-            userId,
-            performedAt: parsedBody.data.performedAt,
-            odometerKm: parsedBody.data.odometerKm,
-            usageProfile,
-            intervalKm,
-            intervalMonths,
-            intervalDays: schedule.intervalDays,
-          },
+            update: {
+              userId,
+              performedAt: parsedBody.data.performedAt,
+              odometerKm: parsedBody.data.odometerKm,
+              usageProfile,
+              intervalKm,
+              intervalMonths,
+              intervalDays: schedule.intervalDays,
+            },
+          });
+
+          await tx.vehicleMaintenanceEvent.create({
+            data: {
+              userId,
+              vehicleId: vehicle.id,
+              item: parsedBody.data.item,
+              source: parsedBody.data.source ?? "baseline_update",
+              performedAt: parsedBody.data.performedAt,
+              odometerKm: parsedBody.data.odometerKm,
+            },
+          });
+
+          return nextBaseline;
         });
 
         if (baseline.item === "engine_oil") {
@@ -1134,6 +1761,241 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
         return reply.code(500).send({
           error: "request_failed",
           message: "Vehicle maintenance baseline upsert failed.",
+        });
+      }
+    },
+  );
+
+  app.get(
+    "/vehicles/:vehicleId/maintenance-events",
+    async (request, reply) => {
+      const parsedParams = vehicleIdParamsSchema.safeParse(request.params);
+
+      if (!parsedParams.success) {
+        return reply.code(400).send(validationError());
+      }
+
+      try {
+        const userId = await getAuthenticatedUserId(request);
+        const vehicle = await getVehicleWithAccess(
+          parsedParams.data.vehicleId,
+          userId,
+        );
+
+        if (!vehicle) {
+          return reply.code(404).send({
+            error: "vehicle_not_found",
+            message: "Vehicle was not found for this user.",
+          });
+        }
+
+        const maintenanceEvents = await prisma.vehicleMaintenanceEvent.findMany({
+          where: { vehicleId: vehicle.id },
+          orderBy: [{ performedAt: "desc" }, { createdAt: "desc" }],
+          take: 200,
+        });
+
+        return reply.send({
+          maintenanceEvents: maintenanceEvents.map(toPublicMaintenanceEvent),
+        });
+      } catch (error) {
+        if (isDatabaseConnectionError(error)) {
+          return reply.code(503).send(databaseUnavailablePayload);
+        }
+
+        if (error instanceof AuthError) {
+          return reply.code(401).send({
+            error: "invalid_access_token",
+            message: "Access token is invalid or expired.",
+          });
+        }
+
+        request.log.warn({ error }, "Vehicle maintenance event list failed.");
+        return reply.code(500).send({
+          error: "request_failed",
+          message: "Vehicle maintenance event list failed.",
+        });
+      }
+    },
+  );
+
+  app.post(
+    "/vehicles/:vehicleId/maintenance-events",
+    async (request, reply) => {
+      const parsedParams = vehicleIdParamsSchema.safeParse(request.params);
+      const parsedBody = maintenanceEventBodySchema.safeParse(request.body);
+
+      if (!parsedParams.success || !parsedBody.success) {
+        return reply.code(400).send(validationError());
+      }
+
+      try {
+        const userId = await getAuthenticatedUserId(request);
+        const vehicle = await getVehicleWithAccess(
+          parsedParams.data.vehicleId,
+          userId,
+        );
+
+        if (!vehicle) {
+          return reply.code(404).send({
+            error: "vehicle_not_found",
+            message: "Vehicle was not found for this user.",
+          });
+        }
+
+        const usageProfile =
+          parsedBody.data.usageProfile ??
+          (parsedBody.data.item === "engine_oil" ? "severe" : undefined);
+        const schedule = getMaintenanceSchedule(
+          parsedBody.data.item,
+          usageProfile,
+        );
+        const intervalKm = parsedBody.data.intervalKm ?? schedule.intervalKm;
+        const intervalMonths =
+          parsedBody.data.intervalMonths ?? schedule.intervalMonths;
+        const result = await prisma.$transaction(async (tx) => {
+          const maintenanceEvent = await tx.vehicleMaintenanceEvent.create({
+            data: {
+              userId,
+              vehicleId: vehicle.id,
+              item: parsedBody.data.item,
+              source: "manual",
+              performedAt: parsedBody.data.performedAt,
+              odometerKm: parsedBody.data.odometerKm,
+              costCents: parsedBody.data.costCents,
+              notes: parsedBody.data.notes,
+            },
+          });
+          const maintenanceBaseline = await tx.vehicleMaintenanceBaseline.upsert({
+            where: {
+              vehicleId_item: {
+                vehicleId: vehicle.id,
+                item: parsedBody.data.item,
+              },
+            },
+            create: {
+              userId,
+              vehicleId: vehicle.id,
+              item: parsedBody.data.item,
+              performedAt: parsedBody.data.performedAt,
+              odometerKm: parsedBody.data.odometerKm,
+              usageProfile,
+              intervalKm,
+              intervalMonths,
+              intervalDays: schedule.intervalDays,
+            },
+            update: {
+              userId,
+              performedAt: parsedBody.data.performedAt,
+              odometerKm: parsedBody.data.odometerKm,
+              usageProfile,
+              intervalKm,
+              intervalMonths,
+              intervalDays: schedule.intervalDays,
+            },
+          });
+
+          return { maintenanceBaseline, maintenanceEvent };
+        });
+
+        if (result.maintenanceBaseline.item === "engine_oil") {
+          await createOilChangeLoggedNotifications({
+            baseline: result.maintenanceBaseline,
+            vehicleId: vehicle.id,
+          }).catch((error) => {
+            request.log.warn(
+              { error },
+              "Oil change notification creation failed.",
+            );
+          });
+        }
+
+        return reply.code(201).send({
+          maintenanceBaseline: toPublicMaintenanceBaseline(
+            result.maintenanceBaseline,
+          ),
+          maintenanceEvent: toPublicMaintenanceEvent(result.maintenanceEvent),
+        });
+      } catch (error) {
+        if (isDatabaseConnectionError(error)) {
+          return reply.code(503).send(databaseUnavailablePayload);
+        }
+
+        if (error instanceof AuthError) {
+          return reply.code(401).send({
+            error: "invalid_access_token",
+            message: "Access token is invalid or expired.",
+          });
+        }
+
+        request.log.warn({ error }, "Vehicle maintenance event creation failed.");
+        return reply.code(500).send({
+          error: "request_failed",
+          message: "Vehicle maintenance event creation failed.",
+        });
+      }
+    },
+  );
+
+  app.get(
+    "/vehicles/:vehicleId/maintenance-health",
+    async (request, reply) => {
+      const parsedParams = vehicleIdParamsSchema.safeParse(request.params);
+
+      if (!parsedParams.success) {
+        return reply.code(400).send(validationError());
+      }
+
+      try {
+        const userId = await getAuthenticatedUserId(request);
+        const vehicle = await prisma.vehicle.findFirst({
+          where: {
+            id: parsedParams.data.vehicleId,
+            accesses: {
+              some: {
+                userId,
+              },
+            },
+          },
+          include: {
+            maintenanceBaselines: true,
+            trips: {
+              orderBy: { startedAt: "desc" },
+              take: 500,
+            },
+          },
+        });
+
+        if (!vehicle) {
+          return reply.code(404).send({
+            error: "vehicle_not_found",
+            message: "Vehicle was not found for this user.",
+          });
+        }
+
+        return reply.send({
+          maintenanceHealth: calculateMaintenanceHealth({
+            currentOdometerKm: vehicle.currentOdometerKm,
+            maintenanceBaselines: vehicle.maintenanceBaselines,
+            trips: vehicle.trips,
+          }),
+        });
+      } catch (error) {
+        if (isDatabaseConnectionError(error)) {
+          return reply.code(503).send(databaseUnavailablePayload);
+        }
+
+        if (error instanceof AuthError) {
+          return reply.code(401).send({
+            error: "invalid_access_token",
+            message: "Access token is invalid or expired.",
+          });
+        }
+
+        request.log.warn({ error }, "Vehicle maintenance health fetch failed.");
+        return reply.code(500).send({
+          error: "request_failed",
+          message: "Vehicle maintenance health fetch failed.",
         });
       }
     },

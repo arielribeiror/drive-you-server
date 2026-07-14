@@ -131,8 +131,14 @@ const toPublicVehicle = (vehicle: Vehicle) => ({
   ownerDocumentMasked: vehicle.ownerDocumentMasked,
   currentOdometerKm: vehicle.currentOdometerKm,
   currentOdometerIsEstimated: vehicle.currentOdometerIsEstimated,
-  verificationStatus: vehicle.verificationStatus,
+  verificationStatus: vehicle.documentConfirmedAt
+    ? ("confirmed_by_user" as const)
+    : ("unconfirmed" as const),
   verificationSource: vehicle.verificationSource,
+  ownershipStatus: vehicle.documentConfirmedAt
+    ? ("confirmed_by_user" as const)
+    : ("unconfirmed" as const),
+  documentConfirmedAt: vehicle.documentConfirmedAt?.toISOString() ?? null,
   heroImageOriginalUrl: vehicle.heroImageOriginalUrl,
   heroImageUrl: vehicle.heroImageUrl,
   updatedAt: vehicle.updatedAt.toISOString(),

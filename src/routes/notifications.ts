@@ -11,6 +11,10 @@ import {
   databaseUnavailablePayload,
   isDatabaseConnectionError,
 } from "../errors.js";
+import {
+  listNotificationPreferences,
+  notificationPreferenceTypes,
+} from "../notifications/preferences.js";
 import { toPublicNotification } from "../notifications/public.js";
 
 const validationError = () => ({
@@ -36,6 +40,25 @@ const unregisterPushDeviceBodySchema = z.object({
     .regex(/^(ExpoPushToken|ExponentPushToken)\[[^\]]+\]$/),
 });
 
+const quietHourSchema = z
+  .string()
+  .regex(/^([01]\d|2[0-3]):[0-5]\d$/)
+  .nullable();
+
+const notificationPreferencesPatchBodySchema = z.object({
+  preferences: z
+    .array(
+      z.object({
+        type: z.enum(notificationPreferenceTypes),
+        inAppEnabled: z.boolean().optional(),
+        pushEnabled: z.boolean().optional(),
+        quietHoursStart: quietHourSchema.optional(),
+        quietHoursEnd: quietHourSchema.optional(),
+      }),
+    )
+    .min(1),
+});
+
 const getAuthenticatedUserId = async (request: FastifyRequest) => {
   const accessToken = getBearerToken(request);
   const userId = await verifyAccessToken(accessToken);
@@ -58,6 +81,13 @@ export const registerNotificationRoutes = async (app: FastifyInstance) => {
       const [notifications, unreadCount] = await Promise.all([
         prisma.appNotification.findMany({
           where: { userId },
+          include: {
+            deliveries: {
+              select: {
+                status: true,
+              },
+            },
+          },
           orderBy: { createdAt: "desc" },
           take: 100,
         }),
@@ -89,6 +119,103 @@ export const registerNotificationRoutes = async (app: FastifyInstance) => {
       return reply.code(500).send({
         error: "request_failed",
         message: "Notification list failed.",
+      });
+    }
+  });
+
+  app.get("/notification-preferences", async (request, reply) => {
+    try {
+      const userId = await getAuthenticatedUserId(request);
+
+      return reply.send({
+        preferences: await listNotificationPreferences(userId),
+      });
+    } catch (error) {
+      if (isDatabaseConnectionError(error)) {
+        return reply.code(503).send(databaseUnavailablePayload);
+      }
+
+      if (error instanceof AuthError) {
+        return reply.code(401).send({
+          error: "invalid_access_token",
+          message: "Access token is invalid or expired.",
+        });
+      }
+
+      request.log.warn({ error }, "Notification preference list failed.");
+      return reply.code(500).send({
+        error: "request_failed",
+        message: "Notification preference list failed.",
+      });
+    }
+  });
+
+  app.patch("/notification-preferences", async (request, reply) => {
+    const parsedBody = notificationPreferencesPatchBodySchema.safeParse(
+      request.body,
+    );
+
+    if (!parsedBody.success) {
+      return reply.code(400).send(validationError());
+    }
+
+    try {
+      const userId = await getAuthenticatedUserId(request);
+
+      await prisma.$transaction(
+        parsedBody.data.preferences.map((preference) =>
+          prisma.notificationPreference.upsert({
+            where: {
+              userId_type: {
+                userId,
+                type: preference.type,
+              },
+            },
+            create: {
+              userId,
+              type: preference.type,
+              inAppEnabled: preference.inAppEnabled ?? true,
+              pushEnabled: preference.pushEnabled ?? true,
+              quietHoursStart: preference.quietHoursStart,
+              quietHoursEnd: preference.quietHoursEnd,
+            },
+            update: {
+              ...(preference.inAppEnabled === undefined
+                ? {}
+                : { inAppEnabled: preference.inAppEnabled }),
+              ...(preference.pushEnabled === undefined
+                ? {}
+                : { pushEnabled: preference.pushEnabled }),
+              ...(preference.quietHoursStart === undefined
+                ? {}
+                : { quietHoursStart: preference.quietHoursStart }),
+              ...(preference.quietHoursEnd === undefined
+                ? {}
+                : { quietHoursEnd: preference.quietHoursEnd }),
+            },
+          }),
+        ),
+      );
+
+      return reply.send({
+        preferences: await listNotificationPreferences(userId),
+      });
+    } catch (error) {
+      if (isDatabaseConnectionError(error)) {
+        return reply.code(503).send(databaseUnavailablePayload);
+      }
+
+      if (error instanceof AuthError) {
+        return reply.code(401).send({
+          error: "invalid_access_token",
+          message: "Access token is invalid or expired.",
+        });
+      }
+
+      request.log.warn({ error }, "Notification preference update failed.");
+      return reply.code(500).send({
+        error: "request_failed",
+        message: "Notification preference update failed.",
       });
     }
   });
