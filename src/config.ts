@@ -78,18 +78,6 @@ const appleClientIds = unique([
   ...splitCsv(env.APPLE_BUNDLE_ID),
 ]);
 
-if (env.NODE_ENV === "production" && googleClientIds.length === 0) {
-  throw new Error("At least one Google client id is required in production.");
-}
-
-if (env.NODE_ENV === "production" && appleClientIds.length === 0) {
-  throw new Error("At least one Apple client id is required in production.");
-}
-
-if (env.NODE_ENV === "production" && !env.RESEND_API_KEY) {
-  throw new Error("RESEND_API_KEY is required in production.");
-}
-
 export const config = {
   nodeEnv: env.NODE_ENV,
   port: env.PORT,

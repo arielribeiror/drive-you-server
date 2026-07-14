@@ -30,22 +30,45 @@ For Waydroid, set `EXPO_PUBLIC_API_URL=http://192.168.240.1:3333` in the app. Fo
 
 This service is ready to deploy on Railway using the Dockerfile in this folder.
 
-1. Create a new Railway project from the GitHub repository.
-2. Set the service root directory to `drive-you-server`.
+1. Create a new Railway project from the `drive-you-server` GitHub repository.
+2. If deploying from a monorepo instead, set the service root directory to `drive-you-server`.
 3. Add a PostgreSQL database to the same Railway project.
-4. Keep the generated `DATABASE_URL` attached to the API service.
-5. Add required environment variables:
+4. Open the API service variables and add `DATABASE_URL` as a reference to the Postgres service. If the database service is named `Postgres`, use:
 
 ```bash
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+```
+
+5. Add the remaining API variables. The minimum production set is:
+
+```bash
+NODE_ENV=production
 JWT_SECRET=<32+ character secret>
 MAGIC_LINK_BASE_URL=driveyou://auth/magic-link
 CORS_ORIGIN=*
+NOTIFICATION_WORKER_ENABLED=true
+```
+
+You can generate a JWT secret locally with:
+
+```bash
+openssl rand -base64 48
+```
+
+For easier setup, copy `.env.railway.example` into Railway's Variables -> Raw Editor and replace placeholders/secrets. Railway does not block the first GitHub deploy to ask for missing environment variables; failed startup usually means the API service variables are incomplete.
+
+Optional variables:
+
+```bash
 GOOGLE_WEB_CLIENT_ID=<same web client id used by the app>
 GOOGLE_IOS_CLIENT_ID=<optional ios client id>
+GOOGLE_ANDROID_CLIENT_ID=<optional android client id>
+APPLE_CLIENT_IDS=<optional comma-separated Apple audiences>
+APPLE_BUNDLE_ID=com.driveyou.app
 RESEND_API_KEY=<optional, only when testing real email delivery>
 RESEND_FROM_EMAIL=Drive You <auth@your-verified-domain.com>
 OPENAI_API_KEY=<optional, only for odometer image reading>
-NOTIFICATION_WORKER_ENABLED=true
+EXPO_PUSH_ACCESS_TOKEN=<optional Expo push access token>
 ```
 
 The Docker image runs `npx prisma migrate deploy` before `node dist/index.js`, so pending Prisma migrations are applied on each deploy before the API starts.
