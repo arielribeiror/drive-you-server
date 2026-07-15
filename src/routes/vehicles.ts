@@ -40,11 +40,14 @@ import { createOilChangeLoggedNotifications } from "../notifications/service.js"
 import { calculateMaintenanceHealth } from "../vehicles/maintenance-health.js";
 import {
   buildFipeValuation,
+  dedupeFipeHistoryByReferenceMonth,
+  FIPE_CHART_HISTORY_LIMIT,
   FipeClient,
   FipeClientError,
   fipeVehicleTypeSchema,
   getConfidentAutomaticCandidate,
-  isFipeCacheFresh,
+  isFipeHistoryCacheFresh,
+  parseBrazilianPriceToCents,
   priceHistoryFromDetail,
   resolveFipeCandidates,
   toFipeDisplayName,
@@ -409,6 +412,7 @@ const getCachedVehicleFipePrices = (
   yearId: string,
 ) =>
   prisma.vehicleFipePrice.findMany({
+    orderBy: [{ fetchedAt: "asc" }, { referenceCode: "asc" }],
     where: {
       fipeCode,
       vehicleId,
@@ -428,44 +432,204 @@ const cacheVehicleFipePrices = async ({
   readonly yearId: string;
 }) => {
   const fetchedAt = new Date();
+  const dedupedHistory = dedupeFipeHistoryByReferenceMonth(history);
+  const shouldDeleteFallbackReference = dedupedHistory.some(
+    (point) => point.referenceCode !== "0",
+  );
+  const cacheHistory = shouldDeleteFallbackReference
+    ? dedupedHistory.filter((point) => point.referenceCode !== "0")
+    : dedupedHistory;
 
-  if (history.length === 0) {
+  if (cacheHistory.length === 0) {
     return [];
   }
 
   await prisma.$transaction(
-    history.map((point) =>
-      prisma.vehicleFipePrice.upsert({
-        where: {
-          vehicleId_fipeCode_yearId_referenceCode: {
+    [
+      ...cacheHistory.map((point) =>
+        prisma.vehicleFipePrice.upsert({
+          where: {
+            vehicleId_fipeCode_yearId_referenceCode: {
+              fipeCode,
+              referenceCode: point.referenceCode,
+              vehicleId,
+              yearId,
+            },
+          },
+          create: {
+            fetchedAt,
             fipeCode,
+            priceCents: point.priceCents,
             referenceCode: point.referenceCode,
+            referenceMonth: point.referenceMonth,
             vehicleId,
             yearId,
           },
-        },
-        create: {
-          fetchedAt,
-          fipeCode,
-          priceCents: point.priceCents,
-          referenceCode: point.referenceCode,
-          referenceMonth: point.referenceMonth,
-          vehicleId,
-          yearId,
-        },
-        update: {
-          fetchedAt,
-          priceCents: point.priceCents,
-          referenceMonth: point.referenceMonth,
-        },
-      }),
-    ),
+          update: {
+            fetchedAt,
+            priceCents: point.priceCents,
+            referenceMonth: point.referenceMonth,
+          },
+        }),
+      ),
+      ...(shouldDeleteFallbackReference
+        ? [
+            prisma.vehicleFipePrice.deleteMany({
+              where: {
+                fipeCode,
+                referenceCode: "0",
+                vehicleId,
+                yearId,
+              },
+            }),
+          ]
+        : []),
+    ],
   );
 
-  return history.map((point) => ({
+  return cacheHistory.map((point) => ({
     ...point,
     fetchedAt,
   }));
+};
+
+const sortReferencesDescending = <
+  Reference extends { readonly code: string },
+>(
+  references: readonly Reference[],
+) =>
+  [...references].sort((left, right) => {
+    const leftCode = Number(left.code);
+    const rightCode = Number(right.code);
+
+    if (Number.isFinite(leftCode) && Number.isFinite(rightCode)) {
+      return rightCode - leftCode;
+    }
+
+    return right.code.localeCompare(left.code);
+  });
+
+const mergeFipeHistory = (
+  ...histories: readonly FipeValuationHistoryPoint[][]
+) => {
+  const pointsByReference = new Map<string, FipeValuationHistoryPoint>();
+
+  for (const point of dedupeFipeHistoryByReferenceMonth(histories.flat())) {
+    pointsByReference.set(point.referenceCode, point);
+  }
+
+  return [...pointsByReference.values()];
+};
+
+const getRecentReferenceFipeHistory = async ({
+  fipeClient,
+  fipeCode,
+  vehicleType,
+  yearId,
+}: {
+  readonly fipeClient: FipeClient;
+  readonly fipeCode: string;
+  readonly vehicleType: NonNullable<Vehicle["fipeVehicleType"]>;
+  readonly yearId: string;
+}) => {
+  const references = sortReferencesDescending(
+    await fipeClient.getReferences(),
+  ).slice(0, FIPE_CHART_HISTORY_LIMIT);
+  const history: FipeValuationHistoryPoint[] = [];
+
+  for (const reference of references) {
+    try {
+      const detail = await fipeClient.getVehicleDetailByFipeCode(
+        vehicleType,
+        fipeCode,
+        yearId,
+        reference.code,
+      );
+
+      history.push({
+        priceCents: parseBrazilianPriceToCents(detail.price),
+        referenceCode: reference.code,
+        referenceMonth: detail.referenceMonth || reference.month,
+      });
+    } catch (error) {
+      if (error instanceof FipeClientError && error.code === "not_found") {
+        continue;
+      }
+
+      if (
+        error instanceof FipeClientError &&
+        error.code === "payment_required"
+      ) {
+        break;
+      }
+
+      throw error;
+    }
+  }
+
+  return history;
+};
+
+const getFipeHistoryForLink = async ({
+  fallbackHistory,
+  fipeClient,
+  fipeCode,
+  vehicleType,
+  yearId,
+}: {
+  readonly fallbackHistory: FipeValuationHistoryPoint[];
+  readonly fipeClient: FipeClient;
+  readonly fipeCode: string;
+  readonly vehicleType: NonNullable<Vehicle["fipeVehicleType"]>;
+  readonly yearId: string;
+}) => {
+  const fallbackDedupedHistory =
+    dedupeFipeHistoryByReferenceMonth(fallbackHistory);
+
+  if (fallbackDedupedHistory.length >= FIPE_CHART_HISTORY_LIMIT) {
+    return fallbackDedupedHistory;
+  }
+
+  let history = fallbackDedupedHistory;
+
+  try {
+    const detail = await fipeClient.getVehicleHistoryByFipeCode(
+      vehicleType,
+      fipeCode,
+      yearId,
+    );
+
+    history = mergeFipeHistory(history, priceHistoryFromDetail(detail));
+  } catch (error) {
+    if (!(error instanceof FipeClientError)) {
+      throw error;
+    }
+  }
+
+  if (
+    dedupeFipeHistoryByReferenceMonth(history).length >=
+    FIPE_CHART_HISTORY_LIMIT
+  ) {
+    return history;
+  }
+
+  try {
+    return mergeFipeHistory(
+      history,
+      await getRecentReferenceFipeHistory({
+        fipeClient,
+        fipeCode,
+        vehicleType,
+        yearId,
+      }),
+    );
+  } catch (error) {
+    if (error instanceof FipeClientError) {
+      return history;
+    }
+
+    throw error;
+  }
 };
 
 const getLinkedFipeValuation = async (
@@ -484,7 +648,7 @@ const getLinkedFipeValuation = async (
     )
   ).map(toCachedFipePrice);
 
-  if (isFipeCacheFresh(cachedPrices)) {
+  if (isFipeHistoryCacheFresh(cachedPrices)) {
     return {
       stale: false,
       valuation: buildFipeValuation(cachedPrices),
@@ -492,14 +656,16 @@ const getLinkedFipeValuation = async (
   }
 
   try {
-    const detail = await fipeClient.getVehicleHistoryByFipeCode(
-      vehicle.fipeVehicleType,
-      vehicle.fipeCode,
-      vehicle.fipeYearId,
-    );
+    const history = await getFipeHistoryForLink({
+      fallbackHistory: cachedPrices,
+      fipeClient,
+      fipeCode: vehicle.fipeCode,
+      vehicleType: vehicle.fipeVehicleType,
+      yearId: vehicle.fipeYearId,
+    });
     const freshPrices = await cacheVehicleFipePrices({
       fipeCode: vehicle.fipeCode,
-      history: priceHistoryFromDetail(detail),
+      history,
       vehicleId: vehicle.id,
       yearId: vehicle.fipeYearId,
     });
@@ -575,16 +741,26 @@ const getFipeResponseForVehicle = async (
       automaticCandidate,
       "automatic",
     );
-    const { stale, valuation } = await getLinkedFipeValuation(
+    const history = await getFipeHistoryForLink({
+      fallbackHistory: automaticCandidate.history,
       fipeClient,
-      linkedVehicle,
-    );
+      fipeCode: automaticCandidate.codeFipe,
+      vehicleType: automaticCandidate.vehicleType,
+      yearId: automaticCandidate.yearId,
+    });
+    const freshPrices = await cacheVehicleFipePrices({
+      fipeCode: automaticCandidate.codeFipe,
+      history,
+      vehicleId: linkedVehicle.id,
+      yearId: automaticCandidate.yearId,
+    });
+    const valuation = buildFipeValuation(freshPrices);
 
     return {
       candidates: [],
       error: null,
       link: toPublicFipeLink(linkedVehicle),
-      stale,
+      stale: false,
       status: valuation ? "linked" : "unavailable",
       valuation,
       vehicle: linkedVehicle,
@@ -1534,25 +1710,28 @@ export const registerVehiclesRoutes = async (app: FastifyInstance) => {
           fipeYearId: yearId,
         },
       });
-
-      await cacheVehicleFipePrices({
+      const history = await getFipeHistoryForLink({
+        fallbackHistory: priceHistoryFromDetail(detail),
+        fipeClient,
         fipeCode: detail.codeFipe,
-        history: priceHistoryFromDetail(detail),
-        vehicleId: updatedVehicle.id,
+        vehicleType,
         yearId,
       });
 
-      const { stale, valuation } = await getLinkedFipeValuation(
-        fipeClient,
-        updatedVehicle,
-      );
+      const freshPrices = await cacheVehicleFipePrices({
+        fipeCode: detail.codeFipe,
+        history,
+        vehicleId: updatedVehicle.id,
+        yearId,
+      });
+      const valuation = buildFipeValuation(freshPrices);
 
       return reply.send({
         fipe: {
           candidates: [],
           error: null,
           link: toPublicFipeLink(updatedVehicle),
-          stale,
+          stale: false,
           status: valuation ? "linked" : "unavailable",
           valuation,
           vehicle: toPublicVehicle(updatedVehicle),

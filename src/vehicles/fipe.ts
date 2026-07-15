@@ -22,17 +22,23 @@ export type FipePriceHistoryItem = {
   price: string;
   reference: string;
 };
-export type FipeVehicleDetail = {
+export type FipeVehicleBaseDetail = {
   brand: string;
   codeFipe: string;
   fuel: string;
   fuelAcronym: string;
   model: string;
   modelYear: number;
-  price: string;
   priceHistory: FipePriceHistoryItem[];
-  referenceMonth: string;
   vehicleType: number;
+};
+export type FipeVehicleDetail = FipeVehicleBaseDetail & {
+  price: string;
+  referenceMonth: string;
+};
+export type FipeVehicleHistoryDetail = FipeVehicleBaseDetail & {
+  price?: string;
+  referenceMonth?: string;
 };
 export type FipeCandidateConfidence = "high" | "low" | "medium";
 export type FipeCandidate = {
@@ -41,6 +47,7 @@ export type FipeCandidate = {
   codeFipe: string;
   confidence: FipeCandidateConfidence;
   displayName: string;
+  history: FipeValuationHistoryPoint[];
   modelCode: string;
   modelName: string;
   modelYear: number;
@@ -88,25 +95,32 @@ const fipePriceHistorySchema = z.object({
   price: z.string(),
   reference: optionCodeSchema,
 });
-const fipeVehicleDetailSchema = z.object({
+const fipeVehicleBaseDetailSchema = z.object({
   brand: z.string(),
   codeFipe: z.string(),
   fuel: z.string().default(""),
   fuelAcronym: z.string().default(""),
   model: z.string(),
   modelYear: z.coerce.number().int(),
-  price: z.string(),
   priceHistory: z.array(fipePriceHistorySchema).default([]),
-  referenceMonth: z.string(),
   vehicleType: z.coerce.number().int(),
 });
+const fipeVehicleDetailSchema = fipeVehicleBaseDetailSchema.extend({
+  price: z.string(),
+  referenceMonth: z.string(),
+});
+const fipeVehicleHistoryDetailSchema = fipeVehicleBaseDetailSchema.extend({
+  price: z.string().optional(),
+  referenceMonth: z.string().optional(),
+});
 
-export const FIPE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const FIPE_HISTORY_LIMIT = 12;
+export const FIPE_CACHE_TTL_MS = 32 * 24 * 60 * 60 * 1000;
+export const FIPE_CHART_HISTORY_LIMIT = 13;
+const FIPE_HISTORY_LIMIT = 24;
 const AUTO_LINK_SCORE_THRESHOLD = 0.7;
 const AUTO_LINK_SCORE_GAP = 0.12;
-const MODEL_CANDIDATE_LIMIT = 6;
-const BRAND_CANDIDATE_LIMIT = 4;
+const MODEL_CANDIDATE_LIMIT = 10;
+const BRAND_CANDIDATE_LIMIT = 5;
 
 export class FipeClientError extends Error {
   constructor(
@@ -114,6 +128,7 @@ export class FipeClientError extends Error {
       | "invalid_response"
       | "network"
       | "not_found"
+      | "payment_required"
       | "rate_limited"
       | "request_failed",
     message: string,
@@ -146,6 +161,15 @@ export const formatBrazilianPriceFromCents = (priceCents: number) =>
     currency: "BRL",
     style: "currency",
   }).format(priceCents / 100);
+
+export const normalizeFipeReferenceMonth = (value: string) =>
+  value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+de\s+/gi, "/")
+    .replace(/[^a-z0-9]+/gi, "/")
+    .replace(/^\/|\/$/g, "")
+    .toLowerCase();
 
 const normalizePathPart = (value: string) => encodeURIComponent(value);
 
@@ -187,6 +211,14 @@ const fetchJson = async <Result>(
 
   if (response.status === 429) {
     throw new FipeClientError("rate_limited", "FIPE rate limit reached.", 429);
+  }
+
+  if (response.status === 402) {
+    throw new FipeClientError(
+      "payment_required",
+      "FIPE extended history requires a paid token.",
+      402,
+    );
   }
 
   if (!response.ok) {
@@ -316,6 +348,27 @@ export class FipeClient {
       this.token,
     );
 
+  getVehicleDetailByFipeCode = (
+    vehicleType: FipeVehicleType,
+    fipeCode: string,
+    yearId: string,
+    referenceCode?: string,
+  ) => {
+    const referenceQuery = referenceCode
+      ? `?reference=${normalizePathPart(referenceCode)}`
+      : "";
+
+    return fetchJson(
+      this.fetchImpl,
+      `${this.baseUrl}/${vehicleType}/${normalizePathPart(
+        fipeCode,
+      )}/years/${normalizePathPart(yearId)}${referenceQuery}`,
+      fipeVehicleDetailSchema,
+      this.timeoutMs,
+      this.token,
+    );
+  };
+
   getVehicleHistoryByFipeCode = (
     vehicleType: FipeVehicleType,
     fipeCode: string,
@@ -326,7 +379,7 @@ export class FipeClient {
       `${this.baseUrl}/${vehicleType}/${normalizePathPart(
         fipeCode,
       )}/years/${normalizePathPart(yearId)}/history`,
-      fipeVehicleDetailSchema,
+      fipeVehicleHistoryDetailSchema,
       this.timeoutMs,
       this.token,
     );
@@ -341,7 +394,7 @@ const normalizeForMatch = (value: string) =>
   value
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\bI\//g, " ")
+    .replace(/\bI\//gi, " ")
     .replace(/[^A-Z0-9]+/gi, " ")
     .replace(/\s+/g, " ")
     .trim()
@@ -349,6 +402,12 @@ const normalizeForMatch = (value: string) =>
 
 const STOP_TOKENS = new Set([
   "A",
+  "ANO",
+  "AT",
+  "AUT",
+  "AUTO",
+  "AUTOMATICA",
+  "AUTOMATICO",
   "CD",
   "COM",
   "DA",
@@ -361,11 +420,16 @@ const STOP_TOKENS = new Set([
   "GAS",
   "GASOLINA",
   "I",
+  "IMP",
+  "IMPORTADO",
   "MEC",
   "MECANICO",
+  "NAC",
+  "NACIONAL",
   "O",
   "OU",
   "P",
+  "PREMIUM",
 ]);
 
 const tokenize = (value: string) =>
@@ -390,11 +454,13 @@ const countOverlap = (left: Set<string>, right: Set<string>) => {
 const scoreBrand = (brandName: string, sourceTokens: Set<string>) => {
   const brandTokens = tokenSet(brandName);
 
-  if (brandTokens.size === 0) {
+  if (brandTokens.size === 0 || sourceTokens.size === 0) {
     return 0;
   }
 
-  return countOverlap(brandTokens, sourceTokens) / brandTokens.size;
+  const overlap = countOverlap(brandTokens, sourceTokens);
+
+  return overlap / Math.min(brandTokens.size, sourceTokens.size);
 };
 
 export const scoreFipeModelMatch = (
@@ -402,18 +468,41 @@ export const scoreFipeModelMatch = (
   brandName: string,
   modelName: string,
 ) => {
-  const sourceTokens = tokenSet(sourceBrandModel);
+  const sourceTokens = [...tokenSet(sourceBrandModel)];
   const brandTokens = tokenSet(brandName);
-  const modelTokens = tokenSet(modelName);
-  const sourceWithoutBrand = new Set(
-    [...sourceTokens].filter((token) => !brandTokens.has(token)),
+  const modelTokens = [...tokenSet(modelName)];
+  const sourceWithoutBrand = sourceTokens.filter(
+    (token) => !brandTokens.has(token),
   );
 
-  if (sourceWithoutBrand.size === 0 || modelTokens.size === 0) {
+  if (sourceWithoutBrand.length === 0 || modelTokens.length === 0) {
     return 0;
   }
 
-  return countOverlap(sourceWithoutBrand, modelTokens) / sourceWithoutBrand.size;
+  const sourceCore = new Set(sourceWithoutBrand);
+  const modelCore = new Set(modelTokens);
+  const overlap = countOverlap(sourceCore, modelCore);
+
+  if (overlap === 0) {
+    return 0;
+  }
+
+  const sourceCoverage = overlap / sourceCore.size;
+  const compactSource = sourceWithoutBrand.join("");
+  const compactModel = modelTokens.join("");
+  const firstSourceToken = sourceWithoutBrand[0];
+  const firstTokenScore =
+    firstSourceToken !== undefined && modelCore.has(firstSourceToken)
+      ? /\d/.test(firstSourceToken) || firstSourceToken.length >= 3
+        ? 0.55
+        : 0.4
+      : 0;
+  const compactScore =
+    compactSource.length >= 3 && compactModel.includes(compactSource)
+      ? 0.82
+      : 0;
+
+  return Math.max(sourceCoverage, firstTokenScore, compactScore);
 };
 
 const confidenceFromScore = (score: number): FipeCandidateConfidence => {
@@ -448,11 +537,47 @@ const getCandidateYears = (
     return years.slice(0, 3);
   }
 
-  return years.filter((year) => {
+  const exactYears = years.filter((year) => {
     const parsedYear = getYearFromYearId(year.code);
 
     return parsedYear !== null && targetYears.includes(parsedYear);
   });
+
+  if (exactYears.length > 0) {
+    return exactYears;
+  }
+
+  const nearestYears = years
+    .map((year) => {
+      const parsedYear = getYearFromYearId(year.code);
+
+      if (parsedYear === null) {
+        return null;
+      }
+
+      return {
+        distance: Math.min(
+          ...targetYears.map((targetYear) => Math.abs(targetYear - parsedYear)),
+        ),
+        year,
+      };
+    })
+    .filter(
+      (item): item is { distance: number; year: FipeVehicleYear } =>
+        item !== null,
+    )
+    .sort((left, right) => left.distance - right.distance);
+
+  const closestDistance = nearestYears[0]?.distance;
+
+  if (closestDistance === undefined || closestDistance > 1) {
+    return [];
+  }
+
+  return nearestYears
+    .filter((item) => item.distance === closestDistance)
+    .map((item) => item.year)
+    .slice(0, 3);
 };
 
 export const toFipeDisplayName = (detail: FipeVehicleDetail) =>
@@ -517,12 +642,15 @@ export const resolveFipeCandidates = async (
               model.code,
               year.code,
             );
+            const history = priceHistoryFromDetail(detail);
+
             candidates.push({
               brandCode: brand.code,
               brandName: brand.name,
               codeFipe: detail.codeFipe,
               confidence: confidenceFromScore(score),
               displayName: toFipeDisplayName(detail),
+              history,
               modelCode: model.code,
               modelName: model.name,
               modelYear: detail.modelYear,
@@ -545,9 +673,19 @@ export const resolveFipeCandidates = async (
     }
   }
 
-  return candidates
-    .sort((left, right) => right.score - left.score)
-    .slice(0, MODEL_CANDIDATE_LIMIT);
+  const uniqueCandidates = new Map<string, FipeCandidate>();
+
+  for (const candidate of candidates.sort(
+    (left, right) => right.score - left.score,
+  )) {
+    const key = `${candidate.vehicleType}:${candidate.codeFipe}:${candidate.yearId}`;
+
+    if (!uniqueCandidates.has(key)) {
+      uniqueCandidates.set(key, candidate);
+    }
+  }
+
+  return [...uniqueCandidates.values()].slice(0, MODEL_CANDIDATE_LIMIT);
 };
 
 export const getConfidentAutomaticCandidate = (
@@ -579,9 +717,25 @@ export const isFipeCacheFresh = (
   const newestFetchTime = Math.max(
     ...prices.map((price) => price.fetchedAt.getTime()),
   );
+  const newestFetchDate = new Date(newestFetchTime);
+  const sameReferenceWindow =
+    newestFetchDate.getUTCFullYear() === now.getUTCFullYear() &&
+    newestFetchDate.getUTCMonth() === now.getUTCMonth();
 
-  return now.getTime() - newestFetchTime <= FIPE_CACHE_TTL_MS;
+  return (
+    sameReferenceWindow &&
+    newestFetchTime <= now.getTime() &&
+    now.getTime() - newestFetchTime <= FIPE_CACHE_TTL_MS
+  );
 };
+
+export const isFipeHistoryCacheFresh = (
+  prices: readonly CachedFipePrice[],
+  now = new Date(),
+) =>
+  new Set(
+    prices.map((price) => normalizeFipeReferenceMonth(price.referenceMonth)),
+  ).size >= FIPE_CHART_HISTORY_LIMIT && isFipeCacheFresh(prices, now);
 
 const sortByReferenceAscending = <Price extends FipeValuationHistoryPoint>(
   prices: readonly Price[],
@@ -597,6 +751,30 @@ const sortByReferenceAscending = <Price extends FipeValuationHistoryPoint>(
     return left.referenceCode.localeCompare(right.referenceCode);
   });
 
+export const dedupeFipeHistoryByReferenceMonth = <
+  Price extends FipeValuationHistoryPoint,
+>(
+  prices: readonly Price[],
+) => {
+  const pointByMonth = new Map<string, Price>();
+
+  for (const point of sortByReferenceAscending(prices)) {
+    const monthKey = normalizeFipeReferenceMonth(point.referenceMonth);
+    const currentPoint = pointByMonth.get(monthKey);
+
+    if (!currentPoint) {
+      pointByMonth.set(monthKey, point);
+      continue;
+    }
+
+    if (currentPoint.referenceCode === "0" && point.referenceCode !== "0") {
+      pointByMonth.set(monthKey, point);
+    }
+  }
+
+  return sortByReferenceAscending([...pointByMonth.values()]);
+};
+
 export const buildFipeValuation = (
   prices: readonly CachedFipePrice[],
   historyLimit = FIPE_HISTORY_LIMIT,
@@ -605,7 +783,7 @@ export const buildFipeValuation = (
     return null;
   }
 
-  const history = sortByReferenceAscending(prices).slice(-historyLimit);
+  const history = dedupeFipeHistoryByReferenceMonth(prices).slice(-historyLimit);
   const first = history[0];
   const current = history.at(-1);
 
@@ -641,22 +819,28 @@ export const buildFipeValuation = (
 };
 
 export const priceHistoryFromDetail = (
-  detail: FipeVehicleDetail,
+  detail: FipeVehicleDetail | FipeVehicleHistoryDetail,
 ): FipeValuationHistoryPoint[] => {
-  const history =
-    detail.priceHistory.length > 0
-      ? detail.priceHistory
-      : [
-          {
-            month: detail.referenceMonth,
-            price: detail.price,
-            reference: "0",
-          },
-        ];
+  if (detail.priceHistory.length > 0) {
+    return detail.priceHistory.map((item) => ({
+      priceCents: parseBrazilianPriceToCents(item.price),
+      referenceCode: item.reference,
+      referenceMonth: item.month,
+    }));
+  }
 
-  return history.map((item) => ({
-    priceCents: parseBrazilianPriceToCents(item.price),
-    referenceCode: item.reference,
-    referenceMonth: item.month,
-  }));
+  if (!detail.price || !detail.referenceMonth) {
+    throw new FipeClientError(
+      "invalid_response",
+      "FIPE detail did not include a price history.",
+    );
+  }
+
+  return [
+    {
+      priceCents: parseBrazilianPriceToCents(detail.price),
+      referenceCode: "0",
+      referenceMonth: detail.referenceMonth,
+    },
+  ];
 };
